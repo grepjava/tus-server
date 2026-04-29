@@ -140,7 +140,12 @@ impl UploadService {
 
         if new_offset == upload.upload_length {
             self.repo.mark_completed(id).await?;
-            self.storage.finalize(&upload.storage_path).await?;
+            let new_path = self.storage
+                .finalize(&upload.storage_path, upload.filename.as_deref())
+                .await?;
+            if new_path != upload.storage_path {
+                self.repo.update_storage_path(id, &new_path).await?;
+            }
             self.emit(id, "completed", None).await;
         }
 

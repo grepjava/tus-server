@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Duration};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use tokio::sync::broadcast;
 use uuid::Uuid;
@@ -12,16 +12,21 @@ use super::{
 pub struct WebhookDispatcher {
     pub repo: Arc<dyn WebhookRepository>,
     upload_service: Arc<UploadService>,
+    storage_dir: PathBuf,
     client: reqwest::Client,
 }
 
 impl WebhookDispatcher {
-    pub fn new(repo: Arc<dyn WebhookRepository>, upload_service: Arc<UploadService>) -> Self {
+    pub fn new(
+        repo: Arc<dyn WebhookRepository>,
+        upload_service: Arc<UploadService>,
+        storage_dir: PathBuf,
+    ) -> Self {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .build()
             .expect("failed to build HTTP client");
-        Self { repo, upload_service, client }
+        Self { repo, upload_service, storage_dir, client }
     }
 
     pub async fn run(self: Arc<Self>, mut rx: broadcast::Receiver<UploadEvent>) {
@@ -48,22 +53,35 @@ impl WebhookDispatcher {
     }
 
     async fn fire(&self, hook: &WebhookConfig, event: &UploadEvent) {
-        // Enrich payload with upload details if available
         let upload = self.upload_service.get_upload(&event.upload_id).await.ok();
 
-        let payload = serde_json::json!({
-            "event_type":    event.event_type,
-            "upload_id":     event.upload_id,
-            "event_id":      event.id,
-            "message":       event.message,
-            "timestamp":     event.created_at,
-            "file": upload.as_ref().map(|u| serde_json::json!({
+        let file_info = upload.as_ref().map(|u| {
+            let abs_path = std::fs::canonicalize(self.storage_dir.join(&u.storage_path))
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|_| {
+                    self.storage_dir
+                        .join(&u.storage_path)
+                        .to_string_lossy()
+                        .to_string()
+                });
+
+            serde_json::json!({
                 "filename":      u.filename,
                 "storage_path":  u.storage_path,
+                "absolute_path": abs_path,
                 "size":          u.upload_length,
                 "offset":        u.upload_offset,
                 "status":        u.status,
-            })),
+            })
+        });
+
+        let payload = serde_json::json!({
+            "event_type":  event.event_type,
+            "upload_id":   event.upload_id,
+            "event_id":    event.id,
+            "message":     event.message,
+            "timestamp":   event.created_at,
+            "file":        file_info,
         });
 
         let mut last_error: Option<String> = None;

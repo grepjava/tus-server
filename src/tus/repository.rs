@@ -17,6 +17,7 @@ pub trait UploadRepository: Send + Sync {
     async fn find_stale(&self, older_than_hours: i64) -> Result<Vec<Upload>, TusError>;
     async fn insert_event(&self, upload_id: &str, event_type: &str, message: Option<&str>) -> Result<(), TusError>;
     async fn list_events(&self, upload_id: &str) -> Result<Vec<UploadEvent>, TusError>;
+    async fn update_storage_path(&self, id: &str, path: &str) -> Result<(), TusError>;
     async fn delete_record(&self, id: &str) -> Result<(), TusError>;
 }
 
@@ -218,6 +219,17 @@ impl UploadRepository for SqliteUploadRepository {
         .await?;
 
         Ok(events)
+    }
+
+    async fn update_storage_path(&self, id: &str, path: &str) -> Result<(), TusError> {
+        let now = Utc::now().to_rfc3339();
+        sqlx::query("UPDATE uploads SET storage_path = ?, updated_at = ? WHERE id = ?")
+            .bind(path)
+            .bind(&now)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 
     async fn delete_record(&self, id: &str) -> Result<(), TusError> {

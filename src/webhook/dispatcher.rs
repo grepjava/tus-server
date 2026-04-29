@@ -3,7 +3,7 @@ use std::{sync::Arc, time::Duration};
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
-use crate::tus::UploadEvent;
+use crate::tus::{UploadEvent, UploadService};
 use super::{
     model::{NewWebhookDelivery, WebhookConfig},
     repository::WebhookRepository,
@@ -11,16 +11,17 @@ use super::{
 
 pub struct WebhookDispatcher {
     pub repo: Arc<dyn WebhookRepository>,
+    upload_service: Arc<UploadService>,
     client: reqwest::Client,
 }
 
 impl WebhookDispatcher {
-    pub fn new(repo: Arc<dyn WebhookRepository>) -> Self {
+    pub fn new(repo: Arc<dyn WebhookRepository>, upload_service: Arc<UploadService>) -> Self {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .build()
             .expect("failed to build HTTP client");
-        Self { repo, client }
+        Self { repo, upload_service, client }
     }
 
     pub async fn run(self: Arc<Self>, mut rx: broadcast::Receiver<UploadEvent>) {
@@ -47,12 +48,22 @@ impl WebhookDispatcher {
     }
 
     async fn fire(&self, hook: &WebhookConfig, event: &UploadEvent) {
+        // Enrich payload with upload details if available
+        let upload = self.upload_service.get_upload(&event.upload_id).await.ok();
+
         let payload = serde_json::json!({
-            "event_type": event.event_type,
-            "upload_id": event.upload_id,
-            "event_id": event.id,
-            "message": event.message,
-            "timestamp": event.created_at,
+            "event_type":    event.event_type,
+            "upload_id":     event.upload_id,
+            "event_id":      event.id,
+            "message":       event.message,
+            "timestamp":     event.created_at,
+            "file": upload.as_ref().map(|u| serde_json::json!({
+                "filename":      u.filename,
+                "storage_path":  u.storage_path,
+                "size":          u.upload_length,
+                "offset":        u.upload_offset,
+                "status":        u.status,
+            })),
         });
 
         let mut last_error: Option<String> = None;

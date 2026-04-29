@@ -38,7 +38,7 @@ async fn main() -> anyhow::Result<()> {
     let state = AppState::new(pool.clone(), config.clone(), event_tx.clone());
 
     let webhook_repo = Arc::new(SqliteWebhookRepository::new(pool));
-    let dispatcher = Arc::new(WebhookDispatcher::new(webhook_repo));
+    let dispatcher = Arc::new(WebhookDispatcher::new(webhook_repo, state.upload_service.clone()));
     tokio::spawn(dispatcher.run(event_tx.subscribe()));
 
     tokio::spawn(manager::run_worker(state.clone()));

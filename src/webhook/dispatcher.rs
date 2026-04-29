@@ -1,8 +1,9 @@
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
+use futures::StreamExt;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, Semaphore};
 use uuid::Uuid;
 
 use crate::tus::{UploadEvent, UploadService};
@@ -12,11 +13,13 @@ use super::{
 };
 
 const MAX_RESPONSE_BODY: usize = 4096;
+const MAX_CONCURRENT_DISPATCHES: usize = 32;
 
 pub struct WebhookDispatcher {
     pub repo: Arc<dyn WebhookRepository>,
     upload_service: Arc<UploadService>,
     storage_dir: PathBuf,
+    semaphore: Arc<Semaphore>,
     client: reqwest::Client,
 }
 
@@ -30,7 +33,13 @@ impl WebhookDispatcher {
             .timeout(Duration::from_secs(10))
             .build()
             .expect("failed to build HTTP client");
-        Self { repo, upload_service, storage_dir, client }
+        Self {
+            repo,
+            upload_service,
+            storage_dir,
+            semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_DISPATCHES)),
+            client,
+        }
     }
 
     pub async fn run(self: Arc<Self>, mut rx: broadcast::Receiver<UploadEvent>) {
@@ -38,7 +47,13 @@ impl WebhookDispatcher {
             match rx.recv().await {
                 Ok(event) => {
                     let d = Arc::clone(&self);
-                    tokio::spawn(async move { d.dispatch(event).await });
+                    tokio::spawn(async move {
+                        // Acquire a slot before doing any real work — caps concurrency
+                        // at MAX_CONCURRENT_DISPATCHES regardless of event burst size.
+                        let _permit = d.semaphore.acquire().await
+                            .expect("semaphore closed unexpectedly");
+                        d.dispatch(event).await;
+                    });
                 }
                 Err(broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(broadcast::error::RecvError::Closed) => break,
@@ -96,7 +111,6 @@ impl WebhookDispatcher {
             "file":        file_info,
         });
 
-        // Serialize once; used for both the request body and HMAC signing
         let body_bytes = match serde_json::to_vec(&payload) {
             Ok(b) => b,
             Err(e) => {
@@ -120,7 +134,6 @@ impl WebhookDispatcher {
                 .header("X-Webhook-Event", &event.event_type)
                 .body(body_bytes.clone());
 
-            // Sign with HMAC-SHA256 instead of sending the raw secret
             if let Some(secret) = &hook.secret {
                 let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes())
                     .expect("HMAC accepts any key length");
@@ -134,10 +147,19 @@ impl WebhookDispatcher {
                     let status = resp.status();
                     last_status = Some(status.as_u16() as i64);
 
-                    // Cap response body to avoid unbounded memory use
-                    let bytes = resp.bytes().await.unwrap_or_default();
-                    let truncated = &bytes[..bytes.len().min(MAX_RESPONSE_BODY)];
-                    last_body = Some(String::from_utf8_lossy(truncated).to_string());
+                    // Stream the response body and stop once the cap is reached —
+                    // avoids buffering an unbounded response into memory.
+                    let mut stream = resp.bytes_stream();
+                    let mut body_buf: Vec<u8> = Vec::with_capacity(MAX_RESPONSE_BODY);
+                    while let Some(chunk) = stream.next().await {
+                        if let Ok(bytes) = chunk {
+                            let bytes: axum::body::Bytes = bytes;
+                            let remaining = MAX_RESPONSE_BODY.saturating_sub(body_buf.len());
+                            if remaining == 0 { break; }
+                            body_buf.extend_from_slice(&bytes[..bytes.len().min(remaining)]);
+                        }
+                    }
+                    last_body = Some(String::from_utf8_lossy(&body_buf).to_string());
 
                     if status.is_success() {
                         last_error = None;

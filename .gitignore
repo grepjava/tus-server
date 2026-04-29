@@ -1,0 +1,26 @@
+# Rust build artifacts
+/target/
+
+# SQLite database
+*.db
+*.db-shm
+*.db-wal
+
+# Upload storage
+/uploads/
+
+# Server runtime files
+server.log
+.server.pid
+
+# Environment secrets
+.env
+
+# Node / SvelteKit
+dashboard-ui/node_modules/
+dashboard-ui/.svelte-kit/
+dashboard-ui/build/
+
+# OS
+.DS_Store
+Thumbs.db

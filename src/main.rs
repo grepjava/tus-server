@@ -13,7 +13,7 @@ use tracing_subscriber::EnvFilter;
 use app_state::AppState;
 use config::Config;
 use tus::UploadEvent;
-use webhook::{SqliteWebhookRepository, WebhookDispatcher};
+use webhook::WebhookDispatcher;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -37,9 +37,8 @@ async fn main() -> anyhow::Result<()> {
     let (event_tx, _) = broadcast::channel::<UploadEvent>(256);
     let state = AppState::new(pool.clone(), config.clone(), event_tx.clone());
 
-    let webhook_repo = Arc::new(SqliteWebhookRepository::new(pool));
     let dispatcher = Arc::new(WebhookDispatcher::new(
-        webhook_repo,
+        state.webhook_repo.clone(),
         state.upload_service.clone(),
         config.storage_dir.clone(),
     ));

@@ -1,5 +1,7 @@
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
@@ -8,6 +10,8 @@ use super::{
     model::{NewWebhookDelivery, WebhookConfig},
     repository::WebhookRepository,
 };
+
+const MAX_RESPONSE_BODY: usize = 4096;
 
 pub struct WebhookDispatcher {
     pub repo: Arc<dyn WebhookRepository>,
@@ -45,7 +49,15 @@ impl WebhookDispatcher {
     async fn dispatch(&self, event: UploadEvent) {
         let hooks = match self.repo.list_for_event(&event.event_type).await {
             Ok(h) => h,
-            Err(_) => return,
+            Err(e) => {
+                tracing::error!(
+                    event_type = %event.event_type,
+                    upload_id  = %event.upload_id,
+                    error      = %e,
+                    "failed to load webhooks for event"
+                );
+                return;
+            }
         };
         for hook in hooks {
             self.fire(&hook, &event).await;
@@ -84,6 +96,15 @@ impl WebhookDispatcher {
             "file":        file_info,
         });
 
+        // Serialize once; used for both the request body and HMAC signing
+        let body_bytes = match serde_json::to_vec(&payload) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::error!(webhook_id = %hook.id, error = %e, "failed to serialize webhook payload");
+                return;
+            }
+        };
+
         let mut last_error: Option<String> = None;
         let mut last_status: Option<i64> = None;
         let mut last_body: Option<String> = None;
@@ -95,17 +116,28 @@ impl WebhookDispatcher {
             let mut builder = self
                 .client
                 .post(&hook.url)
-                .header("X-Webhook-Event", &event.event_type);
+                .header("Content-Type", "application/json")
+                .header("X-Webhook-Event", &event.event_type)
+                .body(body_bytes.clone());
 
+            // Sign with HMAC-SHA256 instead of sending the raw secret
             if let Some(secret) = &hook.secret {
-                builder = builder.header("X-Webhook-Secret", secret);
+                let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes())
+                    .expect("HMAC accepts any key length");
+                mac.update(&body_bytes);
+                let sig = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
+                builder = builder.header("X-Hub-Signature-256", sig);
             }
 
-            match builder.json(&payload).send().await {
+            match builder.send().await {
                 Ok(resp) => {
                     let status = resp.status();
                     last_status = Some(status.as_u16() as i64);
-                    last_body = resp.text().await.ok();
+
+                    // Cap response body to avoid unbounded memory use
+                    let bytes = resp.bytes().await.unwrap_or_default();
+                    let truncated = &bytes[..bytes.len().min(MAX_RESPONSE_BODY)];
+                    last_body = Some(String::from_utf8_lossy(truncated).to_string());
 
                     if status.is_success() {
                         last_error = None;
@@ -126,19 +158,22 @@ impl WebhookDispatcher {
             }
         }
 
-        let _ = self
+        if let Err(e) = self
             .repo
             .insert_delivery(NewWebhookDelivery {
                 id: Uuid::new_v4().to_string(),
                 webhook_id: hook.id.clone(),
                 upload_id: Some(event.upload_id.clone()),
                 event_type: event.event_type.clone(),
-                payload: payload.to_string(),
+                payload: String::from_utf8_lossy(&body_bytes).to_string(),
                 status_code: last_status,
                 response_body: last_body,
                 error: last_error,
                 attempts,
             })
-            .await;
+            .await
+        {
+            tracing::error!(webhook_id = %hook.id, error = %e, "failed to record webhook delivery");
+        }
     }
 }

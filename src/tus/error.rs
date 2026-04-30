@@ -56,6 +56,11 @@ impl IntoResponse for TusError {
             TusError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
 
-        (status, [("Tus-Resumable", "1.0.0")], self.to_string()).into_response()
+        (
+            status,
+            [("Tus-Resumable", "1.0.0"), ("Tus-Version", "1.0.0")],
+            self.to_string(),
+        )
+            .into_response()
     }
 }

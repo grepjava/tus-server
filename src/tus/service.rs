@@ -103,6 +103,10 @@ impl UploadService {
 
         let upload = self.repo.find(id).await?.ok_or(TusError::NotFound)?;
 
+        if upload.status == UploadStatus::Abandoned {
+            return Err(TusError::NotFound);
+        }
+
         if !upload.status.can_receive_chunk() {
             return Err(TusError::InvalidState);
         }

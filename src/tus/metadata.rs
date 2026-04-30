@@ -26,6 +26,9 @@ pub fn parse(header: &str) -> Result<HashMap<String, String>, String> {
             None => String::new(),
         };
 
+        if map.contains_key(key) {
+            return Err(format!("duplicate metadata key: {key}"));
+        }
         map.insert(key.to_string(), value);
     }
 

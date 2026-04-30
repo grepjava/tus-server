@@ -7,6 +7,7 @@ use axum::{
 
 use crate::app_state::AppState;
 use super::error::TusError;
+use super::model::UploadStatus;
 
 const TUS_VERSION: &str = "1.0.0";
 const TUS_SUPPORTED_VERSIONS: &str = "1.0.0";
@@ -96,6 +97,10 @@ pub async fn get_upload_offset(
 
     let upload = state.upload_service.get_upload(&id).await?;
 
+    if upload.status == UploadStatus::Abandoned {
+        return Err(TusError::NotFound);
+    }
+
     Ok((
         StatusCode::OK,
         [
@@ -130,6 +135,12 @@ pub async fn upload_chunk(
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse().ok())
         .ok_or(TusError::MissingHeader("Upload-Offset"))?;
+
+    if client_offset < 0 {
+        return Err(TusError::InvalidHeader(
+            "Upload-Offset must be non-negative".into(),
+        ));
+    }
 
     let content_length: Option<i64> = headers
         .get("Content-Length")

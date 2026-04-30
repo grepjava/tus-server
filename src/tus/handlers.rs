@@ -126,7 +126,7 @@ pub async fn upload_chunk(
         .and_then(|v| v.to_str().ok())
         .ok_or(TusError::MissingHeader("Content-Type"))?;
 
-    if content_type != "application/offset+octet-stream" {
+    if !content_type.starts_with("application/offset+octet-stream") {
         return Err(TusError::InvalidContentType);
     }
 

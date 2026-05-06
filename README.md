@@ -4,13 +4,13 @@ A [TUS 1.0.0](https://tus.io/protocols/resumable-upload) resumable upload server
 
 ## Features
 
-- **Full TUS 1.0.0 protocol** — OPTIONS, POST, HEAD, PATCH, DELETE with `creation` and `termination` extensions
+- **Full TUS 1.0.0 protocol** — OPTIONS, POST, HEAD, PATCH, DELETE with six extensions: `creation`, `creation-defer-length`, `termination`, `concatenation`, `checksum`, `expiration`
 - **SQLite state storage** — zero-dependency database, migrates automatically on startup
 - **Filesystem storage** — streams chunks directly to disk without buffering in memory
 - **Upload lifecycle** — Created → Uploading → Completed → Processing → Finalized (or Failed/Abandoned)
 - **Background workers** — auto-processes completed uploads; cleans up stale ones on a configurable interval
 - **Management dashboard** — Svelte SPA served from the same process; stats, search, filtering, bulk operations, live event log via SSE
-- **Webhooks** — HTTP callbacks on any lifecycle event, configurable per-endpoint, delivery log with automatic retries
+- **Webhooks** — HMAC-SHA256-signed HTTP callbacks on any lifecycle event, configurable per-endpoint, delivery log with automatic retries
 - **Test upload panel** — drag-and-drop TUS client built into the dashboard with configurable chunk size
 - **Trait-based design** — `UploadRepository` and `StorageBackend` are traits; swap in PostgreSQL or S3 without touching business logic
 
@@ -72,6 +72,7 @@ All configuration is via environment variables. Copy `.env.example` to `.env` an
 | `BASE_URL` | `http://localhost:3000` | Public base URL — used in `Location` headers returned to TUS clients |
 | `BIND_ADDR` | `0.0.0.0:3000` | Address and port to listen on |
 | `MAX_UPLOAD_BYTES` | `107374182400` (100 GB) | Maximum allowed `Upload-Length` per upload |
+| `UPLOAD_EXPIRY_HOURS` | `24` | Hours until an upload expires (returned as `Upload-Expires`) |
 | `ABANDONED_AFTER_HOURS` | `24` | Mark uploads with no activity after this many hours as abandoned |
 | `CLEANUP_INTERVAL_SECS` | `3600` | How often the cleanup worker runs |
 | `RUST_LOG` | `info` | Log level (`error`, `warn`, `info`, `debug`, `trace`) |
@@ -87,6 +88,7 @@ All TUS endpoints are mounted at `/files`.
 | Method | Path | Description |
 |---|---|---|
 | `OPTIONS` | `/files` | Returns server capabilities |
+| `OPTIONS` | `/files/:id` | CORS preflight for chunk/delete routes |
 | `POST` | `/files` | Create a new upload, returns `Location` header |
 | `HEAD` | `/files/:id` | Get current offset and length |
 | `PATCH` | `/files/:id` | Upload a chunk |
@@ -132,6 +134,86 @@ curl -X PATCH "$LOCATION" \
   --data-binary @"$FILE"
 ```
 
+### Extensions
+
+#### Deferred length (`creation-defer-length`)
+
+When the total size is not known upfront, omit `Upload-Length` and send `Upload-Defer-Length: 1` in the POST. The server creates the upload without a size limit. Include `Upload-Length` in any subsequent PATCH once the size is known — the server fixes the length at that point and enforces it for remaining chunks.
+
+```bash
+# Create without knowing the size
+LOCATION=$(curl -si -X POST http://localhost:3000/files \
+  -H "Tus-Resumable: 1.0.0" \
+  -H "Upload-Defer-Length: 1" \
+  | grep -i location | tr -d '\r' | awk '{print $2}')
+
+# Upload final chunk, providing the length now
+curl -X PATCH "$LOCATION" \
+  -H "Tus-Resumable: 1.0.0" \
+  -H "Content-Type: application/offset+octet-stream" \
+  -H "Upload-Offset: 0" \
+  -H "Upload-Length: $SIZE" \
+  -H "Content-Length: $SIZE" \
+  --data-binary @"$FILE"
+```
+
+HEAD responses omit `Upload-Length` until the size is finalized.
+
+#### Checksum (`checksum`)
+
+Include `Upload-Checksum: <algorithm> <base64>` in a PATCH to ask the server to verify the chunk. Supported algorithms: `sha1`, `sha256`. The hash is computed while streaming — no extra buffering. On mismatch the server rolls back the written bytes and returns **460 Checksum Mismatch**.
+
+```bash
+SUM=$(sha256sum "$FILE" | awk '{print $1}' | xxd -r -p | base64)
+
+curl -X PATCH "$LOCATION" \
+  -H "Tus-Resumable: 1.0.0" \
+  -H "Content-Type: application/offset+octet-stream" \
+  -H "Upload-Offset: 0" \
+  -H "Upload-Length: $SIZE" \
+  -H "Upload-Checksum: sha256 $SUM" \
+  --data-binary @"$FILE"
+```
+
+#### Expiration (`expiration`)
+
+POST and HEAD responses include an `Upload-Expires` header (RFC 2616 date format). The expiry is computed as `created_at + UPLOAD_EXPIRY_HOURS`. The existing background cleanup worker abandons uploads that have been inactive beyond `ABANDONED_AFTER_HOURS`.
+
+#### Concatenation (`concatenation`)
+
+Upload large files in parallel segments, then merge them in one request.
+
+```bash
+# 1. Create two partial uploads
+P1=$(curl -si -X POST http://localhost:3000/files \
+  -H "Tus-Resumable: 1.0.0" \
+  -H "Upload-Length: $PART1_SIZE" \
+  -H "Upload-Concat: partial" \
+  | grep -i location | tr -d '\r' | awk '{print $2}')
+
+P2=$(curl -si -X POST http://localhost:3000/files \
+  -H "Tus-Resumable: 1.0.0" \
+  -H "Upload-Length: $PART2_SIZE" \
+  -H "Upload-Concat: partial" \
+  | grep -i location | tr -d '\r' | awk '{print $2}')
+
+# 2. Upload each partial (can be done in parallel)
+curl -X PATCH "$P1" -H "Tus-Resumable: 1.0.0" \
+  -H "Content-Type: application/offset+octet-stream" \
+  -H "Upload-Offset: 0" --data-binary @part1.bin
+
+curl -X PATCH "$P2" -H "Tus-Resumable: 1.0.0" \
+  -H "Content-Type: application/offset+octet-stream" \
+  -H "Upload-Offset: 0" --data-binary @part2.bin
+
+# 3. Create the final concatenated upload (returns immediately)
+curl -si -X POST http://localhost:3000/files \
+  -H "Tus-Resumable: 1.0.0" \
+  -H "Upload-Concat: final ;$P1 $P2"
+```
+
+The server concatenates the partial files on disk, marks the final upload as completed, and it flows through the normal processing pipeline.
+
 ## Dashboard
 
 The management dashboard is a SvelteKit SPA served as static files from `dashboard-ui/build/`. It is served automatically by the same Axum process — no separate web server needed.
@@ -172,11 +254,19 @@ curl -X POST http://localhost:3000/api/webhooks \
 
 ```json
 {
-  "event_type": "finalized",
+  "event_type": "completed",
   "upload_id": "a3f2c1d0-...",
   "event_id": "b9e1...",
   "message": null,
-  "timestamp": "2026-04-29T21:14:03Z"
+  "timestamp": "2026-05-07T12:34:56Z",
+  "file": {
+    "filename": "report.pdf",
+    "storage_path": "a3f2c1d0-.../report.pdf",
+    "absolute_path": "/var/uploads/a3f2c1d0-.../report.pdf",
+    "size": 2097152,
+    "offset": 2097152,
+    "status": "Completed"
+  }
 }
 ```
 
@@ -194,15 +284,24 @@ curl -X POST http://localhost:3000/api/webhooks \
 | `deleted` | Upload was deleted via the TUS DELETE endpoint |
 | `retry_queued` | A failed upload was manually queued for retry |
 
-### Secret verification
+### Signature verification
 
-If a secret is set, it is sent as `X-Webhook-Secret: <secret>`. Verify it on the receiver:
+If a `secret` is set, every delivery includes an `X-Hub-Signature-256` header containing an HMAC-SHA256 of the raw JSON body, formatted as `sha256=<hex>`. Verify it on the receiver to ensure the request is genuine:
 
 ```js
+const crypto = require('crypto');
+
 app.post('/hooks/tus', (req, res) => {
-  if (req.headers['x-webhook-secret'] !== process.env.WEBHOOK_SECRET) {
+  const sig = req.headers['x-hub-signature-256'];
+  const expected = 'sha256=' + crypto
+    .createHmac('sha256', process.env.WEBHOOK_SECRET)
+    .update(req.rawBody)           // the raw request body bytes
+    .digest('hex');
+
+  if (!crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected))) {
     return res.sendStatus(401);
   }
+
   // handle event ...
   res.sendStatus(200);
 });
@@ -210,7 +309,7 @@ app.post('/hooks/tus', (req, res) => {
 
 ### Retries
 
-Failed deliveries (non-2xx or network error) are retried up to 3 times with backoff (1 s, then 4 s). The final outcome — HTTP status, response body, error message, attempt count — is stored in `webhook_deliveries` and visible in the dashboard.
+Failed deliveries (non-2xx or network error) are retried up to 3 times with backoff (1 s, then 4 s). The final outcome — HTTP status, response body (capped at 4 KB), error message, attempt count — is stored in `webhook_deliveries` and visible in the dashboard. At most 32 webhook dispatches run concurrently.
 
 ## Management API
 
@@ -294,7 +393,7 @@ tus-server/
 │   │   ├── cleanup.rs        # Periodic stale-upload abandonment
 │   │   └── processor.rs      # Processing entry point — extend this
 │   └── webhook/              # Outbound webhook system
-│       ├── dispatcher.rs     # Broadcasts events → HTTP POST with retries
+│       ├── dispatcher.rs     # Broadcasts events → HMAC-signed HTTP POST with retries
 │       ├── repository.rs     # WebhookRepository trait + SQLite impl
 │       └── model.rs          # WebhookConfig, WebhookDelivery types
 ├── dashboard-ui/             # SvelteKit frontend (adapter-static)
@@ -303,6 +402,9 @@ tus-server/
 │       ├── uploads/[id]/     # Upload detail + live event log
 │       └── webhooks/         # Webhook management + delivery log
 ├── migrations/               # SQLx migrations (run automatically)
+│   ├── 001_initial.sql       # uploads and upload_events tables
+│   ├── 002_webhooks.sql      # webhooks and webhook_deliveries tables
+│   └── 003_tus_extensions.sql# deferred-length and concatenation columns
 ├── start.sh                  # Start server in background (PID file)
 ├── stop.sh                   # Graceful stop (SIGTERM → SIGKILL)
 └── .env.example              # Configuration template
@@ -342,7 +444,7 @@ cd dashboard-ui && npm run check
 
 ### Database schema
 
-Migrations live in [`migrations/`](migrations/) and are embedded into the binary via `sqlx::migrate!()`. They run automatically on every startup. To add a migration, create `migrations/003_your_change.sql`.
+Migrations live in [`migrations/`](migrations/) and are embedded into the binary via `sqlx::migrate!()`. They run automatically on every startup. To add a migration, create `migrations/004_your_change.sql`.
 
 ## Deploying
 
@@ -356,10 +458,9 @@ Migrations live in [`migrations/`](migrations/) and are embedded into the binary
    ```bash
    scp target/release/tus-server user@host:/opt/tus/
    scp -r dashboard-ui/build user@host:/opt/tus/dashboard-ui/
-   scp migrations/ user@host:/opt/tus/   # if not embedded
    ```
 
-3. Set environment variables (via `.env` or systemd `EnvironmentFile`) and run the binary. The binary must be started from the directory containing `dashboard-ui/build/` and `migrations/`, or set paths accordingly.
+3. Set environment variables (via `.env` or systemd `EnvironmentFile`) and run the binary. The binary must be started from the directory containing `dashboard-ui/build/`, or set paths accordingly.
 
 > **Behind a reverse proxy:** set `BASE_URL` to your public URL so `Location` headers returned to TUS clients are correct. Pass `X-Forwarded-For` / `X-Real-IP` headers if you need them upstream.
 

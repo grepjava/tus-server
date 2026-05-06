@@ -23,7 +23,12 @@ impl AppState {
     ) -> Self {
         let repo = Arc::new(SqliteUploadRepository::new(pool.clone()));
         let storage = Arc::new(FilesystemStorage::new(config.storage_dir.clone()));
-        let upload_service = Arc::new(UploadService::new(repo, storage, event_tx.clone()));
+        let upload_service = Arc::new(UploadService::new(
+            repo,
+            storage,
+            event_tx.clone(),
+            config.upload_expiry_hours,
+        ));
         let webhook_repo: Arc<dyn WebhookRepository> =
             Arc::new(SqliteWebhookRepository::new(pool));
 

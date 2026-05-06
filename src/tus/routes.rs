@@ -18,6 +18,10 @@ pub fn tus_router(state: AppState) -> Router {
             HeaderName::from_static("tus-version"),
             HeaderName::from_static("upload-offset"),
             HeaderName::from_static("upload-length"),
+            HeaderName::from_static("upload-expires"),
+            HeaderName::from_static("upload-concat"),
+            HeaderName::from_static("upload-defer-length"),
+            HeaderName::from_static("upload-checksum"),
             header::LOCATION,
         ]);
 

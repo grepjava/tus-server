@@ -17,6 +17,7 @@ pub struct UploadService {
     storage: Arc<dyn StorageBackend>,
     locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     event_tx: broadcast::Sender<UploadEvent>,
+    upload_expiry_hours: i64,
 }
 
 impl UploadService {
@@ -24,12 +25,14 @@ impl UploadService {
         repo: Arc<dyn UploadRepository>,
         storage: Arc<dyn StorageBackend>,
         event_tx: broadcast::Sender<UploadEvent>,
+        upload_expiry_hours: i64,
     ) -> Self {
         Self {
             repo,
             storage,
             locks: Arc::new(Mutex::new(HashMap::new())),
             event_tx,
+            upload_expiry_hours,
         }
     }
 
@@ -163,6 +166,11 @@ impl UploadService {
 
         self.emit(&id, "completed", None).await;
 
+        // Partials have been consumed; mark them so they don't flow into processing
+        for pid in &partial_ids {
+            let _ = self.repo.mark_status(pid, UploadStatus::Abandoned, None).await;
+        }
+
         self.repo.find(&id).await?.ok_or(TusError::NotFound)
     }
 
@@ -186,6 +194,10 @@ impl UploadService {
 
         if upload.status == UploadStatus::Abandoned {
             return Err(TusError::NotFound);
+        }
+
+        if upload.is_expired(self.upload_expiry_hours) {
+            return Err(TusError::Expired);
         }
 
         // Deferred length: accept Upload-Length from the client to finalize the size

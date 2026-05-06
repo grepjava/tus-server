@@ -70,7 +70,7 @@ pub async fn tus_options() -> impl IntoResponse {
               Upload-Defer-Length, Upload-Concat, Tus-Resumable, Content-Type"),
             ("Access-Control-Expose-Headers",
              "Upload-Offset, Upload-Length, Location, Tus-Resumable, Tus-Version, \
-              Upload-Expires, Upload-Concat"),
+              Upload-Expires, Upload-Concat, Upload-Defer-Length, Upload-Checksum"),
         ],
     )
 }
@@ -135,7 +135,9 @@ pub async fn create_upload(
         .map(|v| v.trim().to_string());
 
     if let Some(ref concat) = concat_raw {
-        if let Some(urls_str) = concat.strip_prefix("final ;") {
+        // Accept "final ;urls", "final;urls", "final  ;  url1 url2", etc.
+        if let Some(rest) = concat.strip_prefix("final") {
+            let urls_str = rest.trim_start_matches(|c: char| c.is_whitespace() || c == ';');
             let partial_ids: Vec<String> = urls_str
                 .split_whitespace()
                 .filter_map(|url| url.split('/').next_back().map(str::to_string))
@@ -191,14 +193,18 @@ pub async fn create_upload(
     let location = format!("{}/files/{}", state.config.base_url, upload.id);
     let expires = upload_expires_at(&upload.created_at, state.config.upload_expiry_hours);
 
-    Ok(Response::builder()
+    let mut resp = Response::builder()
         .status(StatusCode::CREATED)
         .header("Tus-Resumable", TUS_VERSION)
         .header("Location", location)
         .header("Upload-Offset", "0")
-        .header("Upload-Expires", expires)
-        .body(Body::empty())
-        .unwrap())
+        .header("Upload-Expires", expires);
+
+    if upload.concat_type.as_deref() == Some("partial") {
+        resp = resp.header("Upload-Concat", "partial");
+    }
+
+    Ok(resp.body(Body::empty()).unwrap())
 }
 
 pub async fn get_upload_offset(
@@ -212,6 +218,10 @@ pub async fn get_upload_offset(
 
     if upload.status == UploadStatus::Abandoned {
         return Err(TusError::NotFound);
+    }
+
+    if upload.is_expired(state.config.upload_expiry_hours) {
+        return Err(TusError::Expired);
     }
 
     let expires = upload_expires_at(&upload.created_at, state.config.upload_expiry_hours);

@@ -81,6 +81,16 @@ pub struct Upload {
     pub concat_uploads: Option<String>,
 }
 
+impl Upload {
+    pub fn is_expired(&self, expiry_hours: i64) -> bool {
+        use chrono::{DateTime, Duration, Utc};
+        let Ok(dt) = DateTime::parse_from_rfc3339(&self.created_at) else {
+            return false;
+        };
+        Utc::now() > Into::<DateTime<Utc>>::into(dt) + Duration::hours(expiry_hours)
+    }
+}
+
 #[derive(Debug)]
 pub struct NewUpload {
     pub id: String,

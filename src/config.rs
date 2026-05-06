@@ -9,6 +9,7 @@ pub struct Config {
     pub max_upload_bytes: i64,
     pub abandoned_after_hours: i64,
     pub cleanup_interval_secs: u64,
+    pub upload_expiry_hours: i64,
 }
 
 impl Config {
@@ -35,6 +36,10 @@ impl Config {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(3600),
+            upload_expiry_hours: std::env::var("UPLOAD_EXPIRY_HOURS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(24),
         })
     }
 }

@@ -30,6 +30,12 @@ pub enum TusError {
     #[error("Content-Type must be application/offset+octet-stream")]
     InvalidContentType,
 
+    #[error("checksum mismatch")]
+    ChecksumMismatch,
+
+    #[error("unsupported checksum algorithm: {0}")]
+    UnsupportedChecksumAlgorithm(String),
+
     #[error("storage error: {0}")]
     Storage(#[from] std::io::Error),
 
@@ -51,6 +57,8 @@ impl IntoResponse for TusError {
             TusError::InvalidState => StatusCode::FORBIDDEN,
             TusError::ExceedsUploadLength => StatusCode::PAYLOAD_TOO_LARGE,
             TusError::InvalidContentType => StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            TusError::ChecksumMismatch => StatusCode::from_u16(460).expect("460 is valid"),
+            TusError::UnsupportedChecksumAlgorithm(_) => StatusCode::BAD_REQUEST,
             TusError::Storage(_) => StatusCode::INTERNAL_SERVER_ERROR,
             TusError::Database(_) => StatusCode::INTERNAL_SERVER_ERROR,
             TusError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,

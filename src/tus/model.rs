@@ -76,6 +76,9 @@ pub struct Upload {
     pub updated_at: String,
     pub completed_at: Option<String>,
     pub error_message: Option<String>,
+    pub length_is_deferred: bool,
+    pub concat_type: Option<String>,
+    pub concat_uploads: Option<String>,
 }
 
 #[derive(Debug)]
@@ -85,6 +88,9 @@ pub struct NewUpload {
     pub upload_length: i64,
     pub metadata_json: Option<String>,
     pub storage_path: String,
+    pub length_is_deferred: bool,
+    pub concat_type: Option<String>,
+    pub concat_uploads: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]

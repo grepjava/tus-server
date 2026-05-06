@@ -1,21 +1,25 @@
 use async_trait::async_trait;
 use axum::body::Body;
 use futures::StreamExt;
+use sha1::Sha1;
+use sha2::{Digest, Sha256};
 use std::path::PathBuf;
-use tokio::{
-    fs,
-    io::AsyncWriteExt,
-};
+use tokio::{fs, io::AsyncWriteExt};
 
 use super::error::TusError;
 
 #[async_trait]
 pub trait StorageBackend: Send + Sync {
     async fn create_empty(&self, upload_id: &str) -> Result<String, TusError>;
-    async fn append_stream(&self, path: &str, body: Body) -> Result<u64, TusError>;
-    /// Renames the .part file to its final name. Returns the new relative path.
+    async fn append_stream(
+        &self,
+        path: &str,
+        body: Body,
+        checksum: Option<(String, Vec<u8>)>,
+    ) -> Result<u64, TusError>;
     async fn finalize(&self, path: &str, filename: Option<&str>) -> Result<String, TusError>;
     async fn delete(&self, path: &str) -> Result<(), TusError>;
+    async fn concat_files(&self, dest_path: &str, source_paths: &[String]) -> Result<u64, TusError>;
 }
 
 pub struct FilesystemStorage {
@@ -40,6 +44,35 @@ fn sanitize_filename(name: &str) -> String {
         .to_string()
 }
 
+enum ChecksumHasher {
+    Sha1(Sha1),
+    Sha256(Sha256),
+}
+
+impl ChecksumHasher {
+    fn from_algorithm(alg: &str) -> Result<Self, TusError> {
+        match alg {
+            "sha1" => Ok(Self::Sha1(Sha1::new())),
+            "sha256" => Ok(Self::Sha256(Sha256::new())),
+            _ => Err(TusError::UnsupportedChecksumAlgorithm(alg.to_string())),
+        }
+    }
+
+    fn update(&mut self, data: &[u8]) {
+        match self {
+            Self::Sha1(h) => Digest::update(h, data),
+            Self::Sha256(h) => Digest::update(h, data),
+        }
+    }
+
+    fn finalize(self) -> Vec<u8> {
+        match self {
+            Self::Sha1(h) => Digest::finalize(h).to_vec(),
+            Self::Sha256(h) => Digest::finalize(h).to_vec(),
+        }
+    }
+}
+
 #[async_trait]
 impl StorageBackend for FilesystemStorage {
     async fn create_empty(&self, upload_id: &str) -> Result<String, TusError> {
@@ -49,42 +82,60 @@ impl StorageBackend for FilesystemStorage {
         Ok(part_name)
     }
 
-    async fn append_stream(&self, path: &str, body: Body) -> Result<u64, TusError> {
-        let file = fs::OpenOptions::new()
-            .append(true)
-            .open(self.full_path(path))
-            .await?;
+    async fn append_stream(
+        &self,
+        path: &str,
+        body: Body,
+        checksum: Option<(String, Vec<u8>)>,
+    ) -> Result<u64, TusError> {
+        let full = self.full_path(path);
+        let original_len = fs::metadata(&full).await.map(|m| m.len()).unwrap_or(0);
 
+        let mut hasher = checksum
+            .as_ref()
+            .map(|(alg, _)| ChecksumHasher::from_algorithm(alg))
+            .transpose()?;
+
+        let file = fs::OpenOptions::new().append(true).open(&full).await?;
         let mut writer = tokio::io::BufWriter::new(file);
         let mut stream = body.into_data_stream();
         let mut bytes_written: u64 = 0;
 
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|e| TusError::Internal(anyhow::anyhow!(e)))?;
+            if let Some(h) = hasher.as_mut() {
+                h.update(&chunk);
+            }
             writer.write_all(&chunk).await?;
             bytes_written += chunk.len() as u64;
         }
-
         writer.flush().await?;
+
+        if let Some((_, expected)) = checksum {
+            let computed = hasher.unwrap().finalize();
+            if computed != expected {
+                if let Ok(f) = fs::OpenOptions::new().write(true).open(&full).await {
+                    let _ = f.set_len(original_len).await;
+                }
+                return Err(TusError::ChecksumMismatch);
+            }
+        }
+
         Ok(bytes_written)
     }
 
     async fn finalize(&self, path: &str, filename: Option<&str>) -> Result<String, TusError> {
         let src = self.full_path(path);
-
-        // Derive the upload ID from the .part filename
         let upload_id = path.trim_end_matches(".part");
 
         let (new_relative, dst) = match filename.map(sanitize_filename).filter(|s| !s.is_empty()) {
             Some(name) => {
-                // Place in a subdirectory named after the upload ID
                 let dir = self.base_dir.join(upload_id);
                 fs::create_dir_all(&dir).await?;
                 let rel = format!("{upload_id}/{name}");
                 (rel.clone(), self.base_dir.join(rel))
             }
             None => {
-                // No filename — just drop the .part extension
                 let rel = upload_id.to_string();
                 (rel.clone(), self.base_dir.join(rel))
             }
@@ -98,7 +149,6 @@ impl StorageBackend for FilesystemStorage {
         let full = self.full_path(path);
         if full.is_file() {
             fs::remove_file(&full).await?;
-            // Remove the parent upload directory if it is now empty and is not the base dir
             if let Some(parent) = full.parent() {
                 if parent != self.base_dir {
                     let _ = fs::remove_dir(parent).await;
@@ -108,5 +158,25 @@ impl StorageBackend for FilesystemStorage {
             fs::remove_dir_all(&full).await?;
         }
         Ok(())
+    }
+
+    async fn concat_files(&self, dest_path: &str, source_paths: &[String]) -> Result<u64, TusError> {
+        let dest = self.full_path(dest_path);
+        let mut dest_file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&dest)
+            .await?;
+
+        let mut total = 0u64;
+        for src_path in source_paths {
+            let src = self.full_path(src_path);
+            let mut src_file = fs::File::open(&src).await?;
+            total += tokio::io::copy(&mut src_file, &mut dest_file).await?;
+        }
+
+        dest_file.flush().await?;
+        Ok(total)
     }
 }

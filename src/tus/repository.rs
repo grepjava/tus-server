@@ -13,6 +13,7 @@ pub trait UploadRepository: Send + Sync {
     async fn update_offset(&self, id: &str, old_offset: i64, new_offset: i64) -> Result<(), TusError>;
     async fn mark_completed(&self, id: &str) -> Result<(), TusError>;
     async fn mark_status(&self, id: &str, status: UploadStatus, error: Option<&str>) -> Result<(), TusError>;
+    async fn set_upload_length(&self, id: &str, length: i64) -> Result<(), TusError>;
     async fn list(&self) -> Result<Vec<Upload>, TusError>;
     async fn find_stale(&self, older_than_hours: i64) -> Result<Vec<Upload>, TusError>;
     async fn insert_event(&self, upload_id: &str, event_type: &str, message: Option<&str>) -> Result<(), TusError>;
@@ -34,6 +35,9 @@ struct UploadRow {
     updated_at: String,
     completed_at: Option<String>,
     error_message: Option<String>,
+    length_is_deferred: i64,
+    concat_type: Option<String>,
+    concat_uploads: Option<String>,
 }
 
 fn row_to_upload(row: UploadRow) -> Result<Upload, TusError> {
@@ -51,6 +55,9 @@ fn row_to_upload(row: UploadRow) -> Result<Upload, TusError> {
         updated_at: row.updated_at,
         completed_at: row.completed_at,
         error_message: row.error_message,
+        length_is_deferred: row.length_is_deferred != 0,
+        concat_type: row.concat_type,
+        concat_uploads: row.concat_uploads,
     })
 }
 
@@ -64,6 +71,10 @@ impl SqliteUploadRepository {
     }
 }
 
+const COLS: &str =
+    "id, filename, upload_length, upload_offset, metadata_json, status, storage_path, \
+     created_at, updated_at, completed_at, error_message, length_is_deferred, concat_type, concat_uploads";
+
 #[async_trait]
 impl UploadRepository for SqliteUploadRepository {
     async fn create(&self, upload: NewUpload) -> Result<Upload, TusError> {
@@ -71,8 +82,10 @@ impl UploadRepository for SqliteUploadRepository {
         let status = UploadStatus::Created.to_string();
 
         sqlx::query(
-            "INSERT INTO uploads (id, filename, upload_length, upload_offset, metadata_json, status, storage_path, created_at, updated_at)
-             VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?)",
+            "INSERT INTO uploads \
+             (id, filename, upload_length, upload_offset, metadata_json, status, storage_path, \
+              created_at, updated_at, length_is_deferred, concat_type, concat_uploads) \
+             VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&upload.id)
         .bind(&upload.filename)
@@ -82,6 +95,9 @@ impl UploadRepository for SqliteUploadRepository {
         .bind(&upload.storage_path)
         .bind(&now)
         .bind(&now)
+        .bind(upload.length_is_deferred as i64)
+        .bind(&upload.concat_type)
+        .bind(&upload.concat_uploads)
         .execute(&self.pool)
         .await?;
 
@@ -90,9 +106,7 @@ impl UploadRepository for SqliteUploadRepository {
 
     async fn find(&self, id: &str) -> Result<Option<Upload>, TusError> {
         let row = sqlx::query_as::<_, UploadRow>(
-            "SELECT id, filename, upload_length, upload_offset, metadata_json, status, storage_path,
-                    created_at, updated_at, completed_at, error_message
-             FROM uploads WHERE id = ?",
+            &format!("SELECT {COLS} FROM uploads WHERE id = ?"),
         )
         .bind(id)
         .fetch_optional(&self.pool)
@@ -106,7 +120,7 @@ impl UploadRepository for SqliteUploadRepository {
         let status = UploadStatus::Uploading.to_string();
 
         let affected = sqlx::query(
-            "UPDATE uploads SET upload_offset = ?, status = ?, updated_at = ?
+            "UPDATE uploads SET upload_offset = ?, status = ?, updated_at = ? \
              WHERE id = ? AND upload_offset = ?",
         )
         .bind(new_offset)
@@ -162,11 +176,24 @@ impl UploadRepository for SqliteUploadRepository {
         Ok(())
     }
 
+    async fn set_upload_length(&self, id: &str, length: i64) -> Result<(), TusError> {
+        let now = Utc::now().to_rfc3339();
+
+        sqlx::query(
+            "UPDATE uploads SET upload_length = ?, length_is_deferred = 0, updated_at = ? WHERE id = ?",
+        )
+        .bind(length)
+        .bind(&now)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
     async fn list(&self) -> Result<Vec<Upload>, TusError> {
         let rows = sqlx::query_as::<_, UploadRow>(
-            "SELECT id, filename, upload_length, upload_offset, metadata_json, status, storage_path,
-                    created_at, updated_at, completed_at, error_message
-             FROM uploads ORDER BY created_at DESC",
+            &format!("SELECT {COLS} FROM uploads ORDER BY created_at DESC"),
         )
         .fetch_all(&self.pool)
         .await?;
@@ -178,11 +205,11 @@ impl UploadRepository for SqliteUploadRepository {
         let threshold = format!("-{older_than_hours} hours");
 
         let rows = sqlx::query_as::<_, UploadRow>(
-            "SELECT id, filename, upload_length, upload_offset, metadata_json, status, storage_path,
-                    created_at, updated_at, completed_at, error_message
-             FROM uploads
-             WHERE status IN ('Created', 'Uploading')
-             AND datetime(updated_at) < datetime('now', ?)",
+            &format!(
+                "SELECT {COLS} FROM uploads \
+                 WHERE status IN ('Created', 'Uploading') \
+                 AND datetime(updated_at) < datetime('now', ?)"
+            ),
         )
         .bind(&threshold)
         .fetch_all(&self.pool)
@@ -211,7 +238,7 @@ impl UploadRepository for SqliteUploadRepository {
 
     async fn list_events(&self, upload_id: &str) -> Result<Vec<UploadEvent>, TusError> {
         let events = sqlx::query_as::<_, UploadEvent>(
-            "SELECT id, upload_id, event_type, message, created_at
+            "SELECT id, upload_id, event_type, message, created_at \
              FROM upload_events WHERE upload_id = ? ORDER BY created_at ASC",
         )
         .bind(upload_id)

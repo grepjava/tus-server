@@ -99,9 +99,14 @@ All TUS endpoints are mounted at `/files`.
 **POST (create):**
 ```
 Tus-Resumable: 1.0.0
-Upload-Length: <total bytes>
-Upload-Metadata: filename <base64-encoded-name>   # optional
+Upload-Length: <total bytes>          # omit when using Upload-Defer-Length
+Upload-Defer-Length: 1                # optional — defer size declaration
+Upload-Metadata: filename <base64>    # optional
+Upload-Concat: partial                # optional — mark as a concat segment
+Upload-Concat: final ;/files/id1 ...  # optional — create a concat final upload
 ```
+
+The response always includes `Upload-Expires`. When `Upload-Concat: partial` is sent, the response echoes `Upload-Concat: partial` to confirm the type.
 
 **PATCH (chunk):**
 ```
@@ -109,6 +114,8 @@ Tus-Resumable: 1.0.0
 Content-Type: application/offset+octet-stream
 Upload-Offset: <current offset>
 Content-Length: <chunk size>
+Upload-Checksum: sha256 <base64>      # optional — verified before write is committed
+Upload-Length: <total bytes>          # optional — only for deferred-length uploads
 ```
 
 ### Example: upload a file with curl
@@ -177,7 +184,14 @@ curl -X PATCH "$LOCATION" \
 
 #### Expiration (`expiration`)
 
-POST and HEAD responses include an `Upload-Expires` header (RFC 2616 date format). The expiry is computed as `created_at + UPLOAD_EXPIRY_HOURS`. The existing background cleanup worker abandons uploads that have been inactive beyond `ABANDONED_AFTER_HOURS`.
+POST and HEAD responses include an `Upload-Expires` header (RFC 2616 date format). The expiry is computed as `created_at + UPLOAD_EXPIRY_HOURS`.
+
+Expiry is **enforced**, not just advertised:
+
+- **HEAD** returns **410 Gone** if the upload is past its expiry time.
+- **PATCH** returns **410 Gone** if the upload is past its expiry time, rolling back any partially written bytes before responding.
+
+The background cleanup worker additionally abandons uploads that have been *inactive* beyond `ABANDONED_AFTER_HOURS` (a separate, inactivity-based threshold).
 
 #### Concatenation (`concatenation`)
 
@@ -185,6 +199,7 @@ Upload large files in parallel segments, then merge them in one request.
 
 ```bash
 # 1. Create two partial uploads
+#    The response confirms the type with: Upload-Concat: partial
 P1=$(curl -si -X POST http://localhost:3000/files \
   -H "Tus-Resumable: 1.0.0" \
   -H "Upload-Length: $PART1_SIZE" \
@@ -207,12 +222,13 @@ curl -X PATCH "$P2" -H "Tus-Resumable: 1.0.0" \
   -H "Upload-Offset: 0" --data-binary @part2.bin
 
 # 3. Create the final concatenated upload (returns immediately)
+#    Both "final ;urls" and "final;urls" are accepted
 curl -si -X POST http://localhost:3000/files \
   -H "Tus-Resumable: 1.0.0" \
   -H "Upload-Concat: final ;$P1 $P2"
 ```
 
-The server concatenates the partial files on disk, marks the final upload as completed, and it flows through the normal processing pipeline.
+The server concatenates the partial files on disk, marks the final upload as `Completed`, and it flows through the normal processing pipeline. The consumed partial uploads are automatically marked `Abandoned` so they do not re-enter the processing queue and are pruned by the cleanup worker.
 
 ## Dashboard
 

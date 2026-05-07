@@ -1,4 +1,5 @@
 mod app_state;
+mod auth;
 mod config;
 mod dashboard;
 mod manager;
@@ -49,7 +50,11 @@ async fn main() -> anyhow::Result<()> {
 
     let app = axum::Router::new()
         .nest("/files", tus::tus_router(state.clone()))
-        .merge(dashboard::dashboard_router(state.clone()));
+        .merge(dashboard::dashboard_router(state.clone()))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth::auth_middleware,
+        ));
 
     let listener = TcpListener::bind(&config.bind_addr).await?;
     tracing::info!("listening on {}", config.bind_addr);

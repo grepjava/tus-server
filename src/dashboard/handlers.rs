@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     app_state::AppState,
     tus::TusError,
-    webhook::{NewWebhookConfig, UpdateWebhookConfig, WebhookConfig},
+    webhook::{validation::validate_webhook_url, NewWebhookConfig, UpdateWebhookConfig, WebhookConfig},
 };
 use crate::tus::Upload;
 
@@ -162,6 +162,7 @@ pub async fn create_webhook(
     State(state): State<AppState>,
     Json(body): Json<NewWebhookConfig>,
 ) -> Result<impl IntoResponse, TusError> {
+    validate_webhook_url(&body.url).await?;
     let webhook = state.webhook_repo.create(body).await?;
     Ok((StatusCode::CREATED, Json(WebhookResponse::from(webhook))))
 }
@@ -171,6 +172,7 @@ pub async fn update_webhook(
     Path(id): Path<String>,
     Json(body): Json<UpdateWebhookConfig>,
 ) -> Result<impl IntoResponse, TusError> {
+    validate_webhook_url(&body.url).await?;
     let webhook = state.webhook_repo.update(&id, body).await?;
     Ok(Json(WebhookResponse::from(webhook)))
 }

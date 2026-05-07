@@ -10,6 +10,9 @@ pub struct Config {
     pub abandoned_after_hours: i64,
     pub cleanup_interval_secs: u64,
     pub upload_expiry_hours: i64,
+    /// When set, all requests must carry `Authorization: Bearer <key>`.
+    /// Unset (default) disables auth — suitable for local/dev use only.
+    pub api_key: Option<String>,
 }
 
 impl Config {
@@ -40,6 +43,7 @@ impl Config {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(24),
+            api_key: std::env::var("API_KEY").ok().filter(|s| !s.is_empty()),
         })
     }
 }

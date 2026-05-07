@@ -37,11 +37,20 @@ impl FilesystemStorage {
 }
 
 fn sanitize_filename(name: &str) -> String {
-    name.chars()
-        .filter(|c| !matches!(c, '/' | '\\' | '\0'))
-        .collect::<String>()
-        .trim()
-        .to_string()
+    // Allowlist: letters, digits, spaces, dots, underscores, hyphens
+    let sanitized: String = name
+        .chars()
+        .filter(|c| c.is_alphanumeric() || matches!(c, ' ' | '.' | '_' | '-'))
+        .collect();
+
+    let trimmed = sanitized.trim();
+
+    // Reject path traversal components
+    if trimmed.split('.').all(|s| s.is_empty()) {
+        return String::new(); // ".", "..", "...", etc.
+    }
+
+    trimmed.to_string()
 }
 
 enum ChecksumHasher {
@@ -187,6 +196,34 @@ mod tests {
     use axum::body::Body;
     use sha2::{Digest, Sha256};
     use crate::tus::TusError;
+
+    #[test]
+    fn sanitize_filename_allows_safe_names() {
+        assert_eq!(super::sanitize_filename("report.pdf"), "report.pdf");
+        assert_eq!(super::sanitize_filename("my file 2024.tar.gz"), "my file 2024.tar.gz");
+        assert_eq!(super::sanitize_filename("file_v1-final.txt"), "file_v1-final.txt");
+    }
+
+    #[test]
+    fn sanitize_filename_strips_dangerous_chars() {
+        assert_eq!(super::sanitize_filename("../../etc/passwd"), "....etcpasswd");
+        assert_eq!(super::sanitize_filename("file\0name"), "filename");
+        assert_eq!(super::sanitize_filename("a/b/c"), "abc");
+        assert_eq!(super::sanitize_filename("a\\b"), "ab");
+    }
+
+    #[test]
+    fn sanitize_filename_rejects_dot_only_names() {
+        assert_eq!(super::sanitize_filename("."), "");
+        assert_eq!(super::sanitize_filename(".."), "");
+        assert_eq!(super::sanitize_filename("..."), "");
+    }
+
+    #[test]
+    fn sanitize_filename_trims_whitespace() {
+        assert_eq!(super::sanitize_filename("  file.txt  "), "file.txt");
+        assert_eq!(super::sanitize_filename("   "), "");
+    }
 
     #[tokio::test]
     async fn checksum_mismatch_rolls_back_written_bytes() {

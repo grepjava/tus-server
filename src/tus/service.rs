@@ -288,13 +288,17 @@ impl UploadService {
         Ok(())
     }
 
-    pub async fn list_uploads(&self) -> Result<Vec<Upload>, TusError> {
-        self.repo.list().await
+    pub async fn list_uploads(&self, limit: i64, offset: i64) -> Result<Vec<Upload>, TusError> {
+        self.repo.list(limit, offset).await
     }
 
-    pub async fn list_events(&self, upload_id: &str) -> Result<Vec<UploadEvent>, TusError> {
+    pub async fn list_completed(&self) -> Result<Vec<Upload>, TusError> {
+        self.repo.list_completed().await
+    }
+
+    pub async fn list_events(&self, upload_id: &str, limit: i64, offset: i64) -> Result<Vec<UploadEvent>, TusError> {
         self.repo.find(upload_id).await?.ok_or(TusError::NotFound)?;
-        self.repo.list_events(upload_id).await
+        self.repo.list_events(upload_id, limit, offset).await
     }
 
     pub async fn retry_processing(&self, id: &str) -> Result<(), TusError> {

@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
     Json,
@@ -12,6 +12,30 @@ use crate::{
     webhook::{validation::validate_webhook_url, NewWebhookConfig, UpdateWebhookConfig, WebhookConfig},
 };
 use crate::tus::Upload;
+
+#[derive(Deserialize)]
+pub struct Pagination {
+    #[serde(default = "default_upload_limit")]
+    pub limit: i64,
+    #[serde(default)]
+    pub offset: i64,
+}
+
+fn default_upload_limit() -> i64 {
+    50
+}
+
+#[derive(Deserialize)]
+pub struct EventPagination {
+    #[serde(default = "default_event_limit")]
+    pub limit: i64,
+    #[serde(default)]
+    pub offset: i64,
+}
+
+fn default_event_limit() -> i64 {
+    200
+}
 
 #[derive(Serialize)]
 pub struct UploadResponse {
@@ -77,10 +101,13 @@ impl From<WebhookConfig> for WebhookResponse {
     }
 }
 
-pub async fn list_uploads(State(state): State<AppState>) -> Result<impl IntoResponse, TusError> {
+pub async fn list_uploads(
+    State(state): State<AppState>,
+    Query(page): Query<Pagination>,
+) -> Result<impl IntoResponse, TusError> {
     let uploads: Vec<UploadResponse> = state
         .upload_service
-        .list_uploads()
+        .list_uploads(page.limit, page.offset)
         .await?
         .into_iter()
         .map(UploadResponse::from)
@@ -99,8 +126,9 @@ pub async fn get_upload(
 pub async fn get_events(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    Query(page): Query<EventPagination>,
 ) -> Result<impl IntoResponse, TusError> {
-    let events = state.upload_service.list_events(&id).await?;
+    let events = state.upload_service.list_events(&id, page.limit, page.offset).await?;
     Ok(Json(events))
 }
 

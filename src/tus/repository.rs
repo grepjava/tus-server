@@ -14,10 +14,11 @@ pub trait UploadRepository: Send + Sync {
     async fn mark_completed(&self, id: &str) -> Result<(), TusError>;
     async fn mark_status(&self, id: &str, status: UploadStatus, error: Option<&str>) -> Result<(), TusError>;
     async fn set_upload_length(&self, id: &str, length: i64) -> Result<(), TusError>;
-    async fn list(&self) -> Result<Vec<Upload>, TusError>;
+    async fn list(&self, limit: i64, offset: i64) -> Result<Vec<Upload>, TusError>;
+    async fn list_completed(&self) -> Result<Vec<Upload>, TusError>;
     async fn find_stale(&self, older_than_hours: i64) -> Result<Vec<Upload>, TusError>;
     async fn insert_event(&self, upload_id: &str, event_type: &str, message: Option<&str>) -> Result<(), TusError>;
-    async fn list_events(&self, upload_id: &str) -> Result<Vec<UploadEvent>, TusError>;
+    async fn list_events(&self, upload_id: &str, limit: i64, offset: i64) -> Result<Vec<UploadEvent>, TusError>;
     async fn update_storage_path(&self, id: &str, path: &str) -> Result<(), TusError>;
     async fn delete_record(&self, id: &str) -> Result<(), TusError>;
 }
@@ -191,9 +192,21 @@ impl UploadRepository for SqliteUploadRepository {
         Ok(())
     }
 
-    async fn list(&self) -> Result<Vec<Upload>, TusError> {
+    async fn list(&self, limit: i64, offset: i64) -> Result<Vec<Upload>, TusError> {
         let rows = sqlx::query_as::<_, UploadRow>(
-            &format!("SELECT {COLS} FROM uploads ORDER BY created_at DESC"),
+            &format!("SELECT {COLS} FROM uploads ORDER BY created_at DESC LIMIT ? OFFSET ?"),
+        )
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(row_to_upload).collect()
+    }
+
+    async fn list_completed(&self) -> Result<Vec<Upload>, TusError> {
+        let rows = sqlx::query_as::<_, UploadRow>(
+            &format!("SELECT {COLS} FROM uploads WHERE status = 'Completed'"),
         )
         .fetch_all(&self.pool)
         .await?;
@@ -236,12 +249,14 @@ impl UploadRepository for SqliteUploadRepository {
         Ok(())
     }
 
-    async fn list_events(&self, upload_id: &str) -> Result<Vec<UploadEvent>, TusError> {
+    async fn list_events(&self, upload_id: &str, limit: i64, offset: i64) -> Result<Vec<UploadEvent>, TusError> {
         let events = sqlx::query_as::<_, UploadEvent>(
             "SELECT id, upload_id, event_type, message, created_at \
-             FROM upload_events WHERE upload_id = ? ORDER BY created_at ASC",
+             FROM upload_events WHERE upload_id = ? ORDER BY created_at ASC LIMIT ? OFFSET ?",
         )
         .bind(upload_id)
+        .bind(limit)
+        .bind(offset)
         .fetch_all(&self.pool)
         .await?;
 

@@ -1,7 +1,7 @@
 use tokio::sync::broadcast::error::RecvError;
 use tracing::{error, info, warn};
 
-use crate::{app_state::AppState, tus::UploadStatus};
+use crate::app_state::AppState;
 use super::processor;
 
 pub async fn run(state: AppState) {
@@ -34,9 +34,9 @@ pub async fn run(state: AppState) {
 }
 
 async fn scan_completed(state: AppState) {
-    match state.upload_service.list_uploads().await {
+    match state.upload_service.list_completed().await {
         Ok(uploads) => {
-            for upload in uploads.into_iter().filter(|u| u.status == UploadStatus::Completed) {
+            for upload in uploads {
                 let s = state.clone();
                 let id = upload.id.clone();
                 tokio::spawn(async move {

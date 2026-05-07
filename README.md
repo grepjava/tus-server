@@ -61,6 +61,13 @@ mkdir -p uploads
 ./target/release/tus-server
 ```
 
+## Client libraries
+
+| Platform | Library | Notes |
+|---|---|---|
+| **Web / Node.js** | [tus-js-client](https://github.com/tus/tus-js-client) | Official TUS client; works in browsers, Node.js, React Native, and Cordova |
+| **Flutter (Android + iOS)** | [tusc](https://pub.dev/packages/tusc) | Pure-Dart client; supports pause/resume, persistent caching, stream-based uploads |
+
 ## Configuration
 
 All configuration is via environment variables. Copy `.env.example` to `.env` and edit as needed — the server loads it automatically on startup.
@@ -111,7 +118,7 @@ The response always includes `Upload-Expires`. When `Upload-Concat: partial` is 
 **PATCH (chunk):**
 ```
 Tus-Resumable: 1.0.0
-Content-Type: application/offset+octet-stream
+Content-Type: application/offset+octet-stream   # parameters (e.g. ; charset=utf-8) are accepted
 Upload-Offset: <current offset>
 Content-Length: <chunk size>
 Upload-Checksum: sha256 <base64>      # optional — verified before write is committed

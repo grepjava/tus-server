@@ -180,3 +180,76 @@ impl StorageBackend for FilesystemStorage {
         Ok(total)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{FilesystemStorage, StorageBackend};
+    use axum::body::Body;
+    use sha2::{Digest, Sha256};
+    use crate::tus::TusError;
+
+    #[tokio::test]
+    async fn checksum_mismatch_rolls_back_written_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = FilesystemStorage::new(dir.path().to_path_buf());
+
+        let path = storage.create_empty("upload-1").await.unwrap();
+
+        // Write initial 5 bytes without checksum
+        storage
+            .append_stream(&path, Body::from(b"hello".to_vec()), None)
+            .await
+            .unwrap();
+
+        let full = dir.path().join(&path);
+        assert_eq!(tokio::fs::metadata(&full).await.unwrap().len(), 5);
+
+        // Write 5 more bytes with a wrong checksum
+        let wrong = Some(("sha256".to_string(), vec![0xffu8; 32]));
+        let err = storage
+            .append_stream(&path, Body::from(b"world".to_vec()), wrong)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, TusError::ChecksumMismatch));
+        // File must be back to exactly 5 bytes
+        assert_eq!(tokio::fs::metadata(&full).await.unwrap().len(), 5);
+    }
+
+    #[tokio::test]
+    async fn correct_sha256_checksum_allows_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = FilesystemStorage::new(dir.path().to_path_buf());
+
+        let path = storage.create_empty("upload-2").await.unwrap();
+        let data = b"hello world";
+        let hash = Sha256::digest(data).to_vec();
+
+        let n = storage
+            .append_stream(&path, Body::from(data.to_vec()), Some(("sha256".to_string(), hash)))
+            .await
+            .unwrap();
+
+        assert_eq!(n, 11);
+        let full = dir.path().join(&path);
+        assert_eq!(tokio::fs::metadata(&full).await.unwrap().len(), 11);
+    }
+
+    #[tokio::test]
+    async fn unsupported_algorithm_returns_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = FilesystemStorage::new(dir.path().to_path_buf());
+
+        let path = storage.create_empty("upload-3").await.unwrap();
+        let err = storage
+            .append_stream(
+                &path,
+                Body::from(b"data".to_vec()),
+                Some(("md5".to_string(), vec![0u8; 16])),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, TusError::UnsupportedChecksumAlgorithm(_)));
+    }
+}

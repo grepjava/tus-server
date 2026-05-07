@@ -46,6 +46,20 @@ fn parse_checksum(headers: &HeaderMap) -> Result<Option<(String, Vec<u8>)>, TusE
     Ok(Some((alg.to_string(), bytes)))
 }
 
+/// Parses an `Upload-Concat: final ...` header value and returns the upload IDs.
+/// Returns `None` if the value does not start with `final`.
+/// Accepts `final ;urls`, `final;urls`, or any whitespace/semicolon combination.
+fn parse_concat_final_ids(value: &str) -> Option<Vec<String>> {
+    let rest = value.trim().strip_prefix("final")?;
+    let urls_str = rest.trim_start_matches(|c: char| c.is_whitespace() || c == ';');
+    let ids = urls_str
+        .split_whitespace()
+        .filter_map(|url| url.split('/').next_back().map(str::to_string))
+        .filter(|s| !s.is_empty())
+        .collect();
+    Some(ids)
+}
+
 fn upload_expires_at(created_at: &str, expiry_hours: i64) -> String {
     use chrono::{DateTime, Duration, Utc};
     let dt: DateTime<Utc> = DateTime::parse_from_rfc3339(created_at)
@@ -135,14 +149,7 @@ pub async fn create_upload(
         .map(|v| v.trim().to_string());
 
     if let Some(ref concat) = concat_raw {
-        // Accept "final ;urls", "final;urls", "final  ;  url1 url2", etc.
-        if let Some(rest) = concat.strip_prefix("final") {
-            let urls_str = rest.trim_start_matches(|c: char| c.is_whitespace() || c == ';');
-            let partial_ids: Vec<String> = urls_str
-                .split_whitespace()
-                .filter_map(|url| url.split('/').next_back().map(str::to_string))
-                .filter(|s| !s.is_empty())
-                .collect();
+        if let Some(partial_ids) = parse_concat_final_ids(concat) {
 
             if partial_ids.is_empty() {
                 return Err(TusError::InvalidHeader(
@@ -321,4 +328,52 @@ pub async fn delete_upload(
         StatusCode::NO_CONTENT,
         [("Tus-Resumable", TUS_VERSION)],
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_concat_final_ids;
+
+    #[test]
+    fn concat_final_ids_standard_form() {
+        let ids = parse_concat_final_ids("final ;/files/abc /files/def").unwrap();
+        assert_eq!(ids, vec!["abc", "def"]);
+    }
+
+    #[test]
+    fn concat_final_ids_no_space_before_semicolon() {
+        let ids = parse_concat_final_ids("final;/files/abc /files/def").unwrap();
+        assert_eq!(ids, vec!["abc", "def"]);
+    }
+
+    #[test]
+    fn concat_final_ids_extra_whitespace() {
+        let ids = parse_concat_final_ids("final  ;  /files/abc  /files/def").unwrap();
+        assert_eq!(ids, vec!["abc", "def"]);
+    }
+
+    #[test]
+    fn concat_final_ids_full_urls() {
+        let ids = parse_concat_final_ids(
+            "final ;http://localhost:3000/files/id1 http://localhost:3000/files/id2",
+        )
+        .unwrap();
+        assert_eq!(ids, vec!["id1", "id2"]);
+    }
+
+    #[test]
+    fn concat_final_ids_single_partial() {
+        let ids = parse_concat_final_ids("final ;/files/only").unwrap();
+        assert_eq!(ids, vec!["only"]);
+    }
+
+    #[test]
+    fn concat_final_ids_returns_none_for_partial() {
+        assert!(parse_concat_final_ids("partial").is_none());
+    }
+
+    #[test]
+    fn concat_final_ids_returns_none_for_unrelated() {
+        assert!(parse_concat_final_ids("random value").is_none());
+    }
 }

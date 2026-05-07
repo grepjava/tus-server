@@ -8,7 +8,7 @@ mod service;
 mod storage;
 
 pub use error::TusError;
-pub use model::{UploadEvent, UploadStatus};
+pub use model::{Upload, UploadEvent, UploadStatus};
 pub use repository::SqliteUploadRepository;
 pub use routes::tus_router;
 pub use service::UploadService;

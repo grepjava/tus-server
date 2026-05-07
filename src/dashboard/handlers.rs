@@ -4,16 +4,87 @@ use axum::{
     response::IntoResponse,
     Json,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     app_state::AppState,
     tus::TusError,
-    webhook::{NewWebhookConfig, UpdateWebhookConfig},
+    webhook::{NewWebhookConfig, UpdateWebhookConfig, WebhookConfig},
 };
+use crate::tus::Upload;
+
+#[derive(Serialize)]
+pub struct UploadResponse {
+    pub id: String,
+    pub filename: Option<String>,
+    pub upload_length: i64,
+    pub upload_offset: i64,
+    pub metadata_json: Option<String>,
+    pub status: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub completed_at: Option<String>,
+    pub error_message: Option<String>,
+    pub length_is_deferred: bool,
+    pub concat_type: Option<String>,
+    pub concat_uploads: Option<String>,
+}
+
+impl From<Upload> for UploadResponse {
+    fn from(u: Upload) -> Self {
+        Self {
+            id: u.id,
+            filename: u.filename,
+            upload_length: u.upload_length,
+            upload_offset: u.upload_offset,
+            metadata_json: u.metadata_json,
+            status: u.status.to_string(),
+            created_at: u.created_at,
+            updated_at: u.updated_at,
+            completed_at: u.completed_at,
+            error_message: u.error_message,
+            length_is_deferred: u.length_is_deferred,
+            concat_type: u.concat_type,
+            concat_uploads: u.concat_uploads,
+        }
+    }
+}
+
+#[derive(Serialize)]
+pub struct WebhookResponse {
+    pub id: String,
+    pub name: String,
+    pub url: String,
+    pub has_secret: bool,
+    pub events: Vec<String>,
+    pub enabled: bool,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+impl From<WebhookConfig> for WebhookResponse {
+    fn from(w: WebhookConfig) -> Self {
+        Self {
+            id: w.id,
+            name: w.name,
+            url: w.url,
+            has_secret: w.secret.is_some(),
+            events: w.events,
+            enabled: w.enabled,
+            created_at: w.created_at,
+            updated_at: w.updated_at,
+        }
+    }
+}
 
 pub async fn list_uploads(State(state): State<AppState>) -> Result<impl IntoResponse, TusError> {
-    let uploads = state.upload_service.list_uploads().await?;
+    let uploads: Vec<UploadResponse> = state
+        .upload_service
+        .list_uploads()
+        .await?
+        .into_iter()
+        .map(UploadResponse::from)
+        .collect();
     Ok(Json(uploads))
 }
 
@@ -22,7 +93,7 @@ pub async fn get_upload(
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, TusError> {
     let upload = state.upload_service.get_upload(&id).await?;
-    Ok(Json(upload))
+    Ok(Json(UploadResponse::from(upload)))
 }
 
 pub async fn get_events(
@@ -77,7 +148,13 @@ pub async fn health() -> impl IntoResponse {
 // Webhook handlers
 
 pub async fn list_webhooks(State(state): State<AppState>) -> Result<impl IntoResponse, TusError> {
-    let webhooks = state.webhook_repo.list().await?;
+    let webhooks: Vec<WebhookResponse> = state
+        .webhook_repo
+        .list()
+        .await?
+        .into_iter()
+        .map(WebhookResponse::from)
+        .collect();
     Ok(Json(webhooks))
 }
 
@@ -86,7 +163,7 @@ pub async fn create_webhook(
     Json(body): Json<NewWebhookConfig>,
 ) -> Result<impl IntoResponse, TusError> {
     let webhook = state.webhook_repo.create(body).await?;
-    Ok((StatusCode::CREATED, Json(webhook)))
+    Ok((StatusCode::CREATED, Json(WebhookResponse::from(webhook))))
 }
 
 pub async fn update_webhook(
@@ -95,7 +172,7 @@ pub async fn update_webhook(
     Json(body): Json<UpdateWebhookConfig>,
 ) -> Result<impl IntoResponse, TusError> {
     let webhook = state.webhook_repo.update(&id, body).await?;
-    Ok(Json(webhook))
+    Ok(Json(WebhookResponse::from(webhook)))
 }
 
 pub async fn delete_webhook(

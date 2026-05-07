@@ -43,6 +43,10 @@ impl UploadService {
             .clone()
     }
 
+    async fn prune_lock(&self, upload_id: &str) {
+        self.locks.lock().await.remove(upload_id);
+    }
+
     async fn emit(&self, upload_id: &str, event_type: &str, message: Option<&str>) {
         let _ = self.repo.insert_event(upload_id, event_type, message).await;
         let event = UploadEvent {
@@ -169,7 +173,9 @@ impl UploadService {
         // Partials have been consumed; mark them so they don't flow into processing
         for pid in &partial_ids {
             let _ = self.repo.mark_status(pid, UploadStatus::Abandoned, None).await;
+            self.prune_lock(pid).await;
         }
+        self.prune_lock(&id).await;
 
         self.repo.find(&id).await?.ok_or(TusError::NotFound)
     }
@@ -267,6 +273,7 @@ impl UploadService {
                 self.repo.update_storage_path(id, &new_path).await?;
             }
             self.emit(id, "completed", None).await;
+            self.prune_lock(id).await;
         }
 
         Ok(new_offset)
@@ -277,6 +284,7 @@ impl UploadService {
         self.storage.delete(&upload.storage_path).await?;
         self.repo.mark_status(id, UploadStatus::Abandoned, None).await?;
         self.emit(id, "deleted", None).await;
+        self.prune_lock(id).await;
         Ok(())
     }
 
@@ -301,6 +309,14 @@ impl UploadService {
 
     pub async fn mark_abandoned(&self, id: &str) -> Result<(), TusError> {
         self.repo.find(id).await?.ok_or(TusError::NotFound)?;
+        self.repo.mark_status(id, UploadStatus::Abandoned, None).await?;
+        self.emit(id, "abandoned", None).await;
+        Ok(())
+    }
+
+    pub async fn abandon_and_delete(&self, id: &str) -> Result<(), TusError> {
+        let upload = self.repo.find(id).await?.ok_or(TusError::NotFound)?;
+        let _ = self.storage.delete(&upload.storage_path).await;
         self.repo.mark_status(id, UploadStatus::Abandoned, None).await?;
         self.emit(id, "abandoned", None).await;
         Ok(())
@@ -338,6 +354,7 @@ impl UploadService {
         let upload = self.repo.find(id).await?.ok_or(TusError::NotFound)?;
         let _ = self.storage.delete(&upload.storage_path).await;
         self.repo.delete_record(id).await?;
+        self.prune_lock(id).await;
         Ok(())
     }
 

@@ -18,9 +18,9 @@ async fn run_once(state: AppState) {
     match state.upload_service.find_stale(hours).await {
         Ok(stale) => {
             for upload in stale {
-                info!(upload_id = %upload.id, "marking stale upload as abandoned");
-                if let Err(e) = state.upload_service.mark_abandoned(&upload.id).await {
-                    warn!(upload_id = %upload.id, error = %e, "failed to mark abandoned");
+                info!(upload_id = %upload.id, "abandoning stale upload and deleting storage");
+                if let Err(e) = state.upload_service.abandon_and_delete(&upload.id).await {
+                    warn!(upload_id = %upload.id, error = %e, "failed to abandon stale upload");
                 }
             }
         }

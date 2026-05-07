@@ -14,7 +14,6 @@ use super::model::UploadStatus;
 const TUS_VERSION: &str = "1.0.0";
 const TUS_SUPPORTED_VERSIONS: &str = "1.0.0";
 const TUS_EXTENSIONS: &str = "creation,creation-defer-length,termination,concatenation,checksum,expiration";
-const TUS_MAX_SIZE: &str = "107374182400";
 
 fn require_tus_resumable(headers: &HeaderMap) -> Result<(), TusError> {
     let version = headers
@@ -70,23 +69,22 @@ fn upload_expires_at(created_at: &str, expiry_hours: i64) -> String {
         .to_string()
 }
 
-pub async fn tus_options() -> impl IntoResponse {
-    (
-        StatusCode::NO_CONTENT,
-        [
-            ("Tus-Resumable", TUS_VERSION),
-            ("Tus-Version", TUS_SUPPORTED_VERSIONS),
-            ("Tus-Extension", TUS_EXTENSIONS),
-            ("Tus-Max-Size", TUS_MAX_SIZE),
-            ("Access-Control-Allow-Methods", "POST, HEAD, PATCH, DELETE, OPTIONS"),
-            ("Access-Control-Allow-Headers",
-             "Upload-Offset, Upload-Length, Upload-Metadata, Upload-Checksum, \
-              Upload-Defer-Length, Upload-Concat, Tus-Resumable, Content-Type"),
-            ("Access-Control-Expose-Headers",
-             "Upload-Offset, Upload-Length, Location, Tus-Resumable, Tus-Version, \
-              Upload-Expires, Upload-Concat, Upload-Defer-Length, Upload-Checksum"),
-        ],
-    )
+pub async fn tus_options(State(state): State<AppState>) -> impl IntoResponse {
+    Response::builder()
+        .status(StatusCode::NO_CONTENT)
+        .header("Tus-Resumable", TUS_VERSION)
+        .header("Tus-Version", TUS_SUPPORTED_VERSIONS)
+        .header("Tus-Extension", TUS_EXTENSIONS)
+        .header("Tus-Max-Size", state.config.max_upload_bytes.to_string())
+        .header("Access-Control-Allow-Methods", "POST, HEAD, PATCH, DELETE, OPTIONS")
+        .header("Access-Control-Allow-Headers",
+            "Upload-Offset, Upload-Length, Upload-Metadata, Upload-Checksum, \
+             Upload-Defer-Length, Upload-Concat, Tus-Resumable, Content-Type")
+        .header("Access-Control-Expose-Headers",
+            "Upload-Offset, Upload-Length, Location, Tus-Resumable, Tus-Version, \
+             Upload-Expires, Upload-Concat, Upload-Defer-Length, Upload-Checksum")
+        .body(Body::empty())
+        .unwrap()
 }
 
 pub async fn create_upload(

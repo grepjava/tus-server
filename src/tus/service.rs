@@ -4,6 +4,7 @@ use axum::body::Body;
 use tokio::sync::{broadcast, Mutex};
 use uuid::Uuid;
 
+use crate::{context::ContextCache, metrics::{AppMetrics, ContextLabels}};
 use super::{
     error::TusError,
     metadata,
@@ -18,6 +19,10 @@ pub struct UploadService {
     locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     event_tx: broadcast::Sender<UploadEvent>,
     upload_expiry_hours: i64,
+    metrics: Arc<AppMetrics>,
+    quota_max_storage_bytes: i64,
+    quota_max_active_uploads: i64,
+    context_cache: ContextCache,
 }
 
 impl UploadService {
@@ -26,6 +31,10 @@ impl UploadService {
         storage: Arc<dyn StorageBackend>,
         event_tx: broadcast::Sender<UploadEvent>,
         upload_expiry_hours: i64,
+        metrics: Arc<AppMetrics>,
+        quota_max_storage_bytes: i64,
+        quota_max_active_uploads: i64,
+        context_cache: ContextCache,
     ) -> Self {
         Self {
             repo,
@@ -33,7 +42,20 @@ impl UploadService {
             locks: Arc::new(Mutex::new(HashMap::new())),
             event_tx,
             upload_expiry_hours,
+            metrics,
+            quota_max_storage_bytes,
+            quota_max_active_uploads,
+            context_cache,
         }
+    }
+
+    /// Resolve a context UUID to its slug for metric labels. Returns "global" for None.
+    async fn context_label(&self, context_id: Option<&str>) -> ContextLabels {
+        let context = match context_id {
+            None => "global".to_string(),
+            Some(id) => self.context_cache.slug_for_id(id).await.unwrap_or_else(|| "global".to_string()),
+        };
+        ContextLabels { context }
     }
 
     async fn lock(&self, upload_id: &str) -> Arc<Mutex<()>> {
@@ -47,14 +69,15 @@ impl UploadService {
         self.locks.lock().await.remove(upload_id);
     }
 
-    async fn emit(&self, upload_id: &str, event_type: &str, message: Option<&str>) {
-        let _ = self.repo.insert_event(upload_id, event_type, message).await;
+    async fn emit(&self, upload_id: &str, event_type: &str, message: Option<&str>, context_id: Option<&str>) {
+        let _ = self.repo.insert_event(upload_id, event_type, message, context_id).await;
         let event = UploadEvent {
             id: Uuid::new_v4().to_string(),
             upload_id: upload_id.to_string(),
             event_type: event_type.to_string(),
             message: message.map(str::to_string),
             created_at: chrono::Utc::now().to_rfc3339(),
+            context_id: context_id.map(str::to_string),
         };
         let _ = self.event_tx.send(event);
     }
@@ -65,7 +88,32 @@ impl UploadService {
         metadata_header: Option<&str>,
         length_is_deferred: bool,
         concat_type: Option<String>,
+        context_id: Option<&str>,
     ) -> Result<Upload, TusError> {
+        if self.quota_max_active_uploads > 0 {
+            let active = self.repo.count_active_uploads().await?;
+            if active >= self.quota_max_active_uploads {
+                return Err(TusError::QuotaExceeded(format!(
+                    "active upload limit reached ({active}/{})",
+                    self.quota_max_active_uploads
+                )));
+            }
+        }
+
+        if self.quota_max_storage_bytes > 0 && !length_is_deferred && upload_length > 0 {
+            let used = self.repo.count_active_storage_bytes().await?;
+            if used + upload_length > self.quota_max_storage_bytes {
+                return Err(TusError::QuotaExceeded(format!(
+                    "storage quota would be exceeded ({} + {} > {})",
+                    used, upload_length, self.quota_max_storage_bytes
+                )));
+            }
+        }
+
+        if upload_length > 0 {
+            self.storage.check_staging_capacity(upload_length as u64).await?;
+        }
+
         let id = Uuid::new_v4().to_string();
 
         let (filename, metadata_json) = match metadata_header {
@@ -92,10 +140,13 @@ impl UploadService {
                 length_is_deferred,
                 concat_type,
                 concat_uploads: None,
+                context_id: context_id.map(str::to_string),
             })
             .await?;
 
-        self.emit(&id, "created", None).await;
+        let lbl = self.context_label(context_id).await;
+        self.metrics.uploads_created_total.get_or_create(&lbl).inc();
+        self.emit(&id, "created", None, context_id).await;
         Ok(upload)
     }
 
@@ -103,6 +154,7 @@ impl UploadService {
         &self,
         partial_ids: Vec<String>,
         metadata_header: Option<&str>,
+        context_id: Option<&str>,
     ) -> Result<Upload, TusError> {
         let id = Uuid::new_v4().to_string();
 
@@ -116,6 +168,11 @@ impl UploadService {
             }
             if p.status != UploadStatus::Completed {
                 return Err(TusError::InvalidState);
+            }
+            // Partials must belong to the same context as the final upload.
+            // Return NotFound (not Forbidden) to avoid leaking cross-context IDs.
+            if p.context_id.as_deref() != context_id {
+                return Err(TusError::NotFound);
             }
             partials.push(p);
         }
@@ -152,6 +209,7 @@ impl UploadService {
                 length_is_deferred: false,
                 concat_type: Some("final".to_string()),
                 concat_uploads: Some(concat_uploads_json),
+                context_id: context_id.map(str::to_string),
             })
             .await?;
 
@@ -168,11 +226,14 @@ impl UploadService {
             self.repo.update_storage_path(&id, &new_path).await?;
         }
 
-        self.emit(&id, "completed", None).await;
+        let lbl = self.context_label(context_id).await;
+        self.metrics.uploads_completed_total.get_or_create(&lbl).inc();
+        self.emit(&id, "completed", None, context_id).await;
 
-        // Partials have been consumed; mark them so they don't flow into processing
+        // Partials have been consumed; mark them so they don't flow into processing.
+        // ConsumedByConcat (not Abandoned) so the dashboard shows the correct reason.
         for pid in &partial_ids {
-            let _ = self.repo.mark_status(pid, UploadStatus::Abandoned, None).await;
+            let _ = self.repo.mark_status(pid, UploadStatus::ConsumedByConcat, None).await;
             self.prune_lock(pid).await;
         }
         self.prune_lock(&id).await;
@@ -198,7 +259,7 @@ impl UploadService {
 
         let mut upload = self.repo.find(id).await?.ok_or(TusError::NotFound)?;
 
-        if upload.status == UploadStatus::Abandoned {
+        if matches!(upload.status, UploadStatus::Abandoned | UploadStatus::ConsumedByConcat) {
             return Err(TusError::NotFound);
         }
 
@@ -246,6 +307,8 @@ impl UploadService {
             .storage
             .append_stream(&upload.storage_path, body, checksum)
             .await?;
+        let ctx_lbl = self.context_label(upload.context_id.as_deref()).await;
+        self.metrics.bytes_uploaded_total.get_or_create(&ctx_lbl).inc_by(bytes_written);
         let new_offset = upload.upload_offset + bytes_written as i64;
 
         if !upload.length_is_deferred && new_offset > upload.upload_length {
@@ -256,10 +319,12 @@ impl UploadService {
             .update_offset(id, upload.upload_offset, new_offset)
             .await?;
 
+        let ctx_id = upload.context_id.as_deref();
         self.emit(
             id,
             "chunk_received",
             Some(&format!("{new_offset}/{}", upload.upload_length)),
+            ctx_id,
         )
         .await;
 
@@ -272,7 +337,12 @@ impl UploadService {
             if new_path != upload.storage_path {
                 self.repo.update_storage_path(id, &new_path).await?;
             }
-            self.emit(id, "completed", None).await;
+            self.metrics.uploads_completed_total.get_or_create(&ctx_lbl).inc();
+            self.emit(id, "completed", None, ctx_id).await;
+            // Drop the guard before pruning so the map entry is only removed
+            // after the mutex is fully released, closing the window where a
+            // concurrent request could acquire a fresh lock on the same ID.
+            drop(_guard);
             self.prune_lock(id).await;
         }
 
@@ -281,9 +351,10 @@ impl UploadService {
 
     pub async fn delete_upload(&self, id: &str) -> Result<(), TusError> {
         let upload = self.repo.find(id).await?.ok_or(TusError::NotFound)?;
+        let ctx_id = upload.context_id.clone();
         self.storage.delete(&upload.storage_path).await?;
         self.repo.mark_status(id, UploadStatus::Abandoned, None).await?;
-        self.emit(id, "deleted", None).await;
+        self.emit(id, "deleted", None, ctx_id.as_deref()).await;
         self.prune_lock(id).await;
         Ok(())
     }
@@ -306,23 +377,28 @@ impl UploadService {
         if !upload.status.can_retry() {
             return Err(TusError::InvalidState);
         }
+        let ctx_id = upload.context_id;
         self.repo.mark_status(id, UploadStatus::Completed, None).await?;
-        self.emit(id, "retry_queued", None).await;
+        self.emit(id, "retry_queued", None, ctx_id.as_deref()).await;
         Ok(())
     }
 
     pub async fn mark_abandoned(&self, id: &str) -> Result<(), TusError> {
-        self.repo.find(id).await?.ok_or(TusError::NotFound)?;
+        let upload = self.repo.find(id).await?.ok_or(TusError::NotFound)?;
+        let ctx_id = upload.context_id;
         self.repo.mark_status(id, UploadStatus::Abandoned, None).await?;
-        self.emit(id, "abandoned", None).await;
+        self.emit(id, "abandoned", None, ctx_id.as_deref()).await;
         Ok(())
     }
 
     pub async fn abandon_and_delete(&self, id: &str) -> Result<(), TusError> {
         let upload = self.repo.find(id).await?.ok_or(TusError::NotFound)?;
-        let _ = self.storage.delete(&upload.storage_path).await;
+        let ctx_id = upload.context_id.clone();
+        // Mark DB first so a crash between these two steps leaves the record
+        // in a terminal state rather than live-but-missing-file.
         self.repo.mark_status(id, UploadStatus::Abandoned, None).await?;
-        self.emit(id, "abandoned", None).await;
+        let _ = self.storage.delete(&upload.storage_path).await;
+        self.emit(id, "abandoned", None, ctx_id.as_deref()).await;
         Ok(())
     }
 
@@ -335,22 +411,27 @@ impl UploadService {
         if !upload.status.can_process() {
             return Err(TusError::InvalidState);
         }
+        let ctx_id = upload.context_id;
         self.repo.mark_status(id, UploadStatus::Processing, None).await?;
-        self.emit(id, "processing_started", None).await;
+        self.emit(id, "processing_started", None, ctx_id.as_deref()).await;
         Ok(())
     }
 
     pub async fn complete_processing(&self, id: &str) -> Result<(), TusError> {
+        let ctx_id = self.repo.find(id).await?.and_then(|u| u.context_id);
         self.repo.mark_status(id, UploadStatus::Finalized, None).await?;
-        self.emit(id, "finalized", None).await;
+        self.emit(id, "finalized", None, ctx_id.as_deref()).await;
         Ok(())
     }
 
     pub async fn fail_processing(&self, id: &str, error: &str) -> Result<(), TusError> {
+        let ctx_id = self.repo.find(id).await?.and_then(|u| u.context_id);
         self.repo
             .mark_status(id, UploadStatus::FailedProcessing, Some(error))
             .await?;
-        self.emit(id, "processing_failed", Some(error)).await;
+        let lbl = self.context_label(ctx_id.as_deref()).await;
+        self.metrics.processing_failures_total.get_or_create(&lbl).inc();
+        self.emit(id, "processing_failed", Some(error), ctx_id.as_deref()).await;
         Ok(())
     }
 
@@ -370,5 +451,18 @@ impl UploadService {
             }
         }
         Ok(deleted)
+    }
+
+    pub async fn storage_health(&self) -> Result<(), TusError> {
+        self.storage.health().await
+    }
+
+    pub async fn open_for_read(
+        &self,
+        path: &str,
+        offset: u64,
+        length: u64,
+    ) -> Result<Body, TusError> {
+        self.storage.open_for_read(path, offset, length).await
     }
 }

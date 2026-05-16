@@ -1,0 +1,12 @@
+target/
+dashboard-ui/node_modules/
+dashboard-ui/build/
+uploads/
+*.db
+sqlite:*.db
+*.log
+.env
+.env.*
+.git/
+.claude/
+docs/

@@ -1,15 +1,21 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { api } from '$lib/api';
-  import type { Upload } from '$lib/types';
+  import type { Upload, Context } from '$lib/types';
 
   type Group = 'all' | 'active' | 'processing' | 'finalized' | 'failed' | 'abandoned';
 
-  const ACTIVE = ['Created', 'Uploading'];
-  const FAILED = ['FailedUpload', 'FailedProcessing', 'FailedFinalization'];
+  const ACTIVE    = ['Created', 'Uploading'];
+  const FAILED    = ['FailedUpload', 'FailedProcessing', 'FailedFinalization'];
+  const ABANDONED = ['Abandoned', 'ConsumedByConcat'];
+
+  const PAGE_SIZE = 50;
+  let pageLimit   = $state(PAGE_SIZE);
 
   let uploads     = $state<Upload[]>([]);
+  let contexts    = $state<Context[]>([]);
   let loading     = $state(true);
+  let loadingMore = $state(false);
   let error       = $state<string | null>(null);
   let actionError = $state<string | null>(null);
   let group       = $state<Group>('all');
@@ -19,13 +25,15 @@
   let selected    = $state(new Set<string>());
   let bulkWorking = $state(false);
 
+  let mayHaveMore = $derived(uploads.length === pageLimit);
+
   let stats = $derived.by(() => ({
     total:      uploads.length,
     active:     uploads.filter(u => ACTIVE.includes(u.status)).length,
     processing: uploads.filter(u => u.status === 'Processing').length,
     finalized:  uploads.filter(u => u.status === 'Finalized').length,
     failed:     uploads.filter(u => FAILED.includes(u.status)).length,
-    abandoned:  uploads.filter(u => u.status === 'Abandoned').length,
+    abandoned:  uploads.filter(u => ABANDONED.includes(u.status)).length,
     bytes:      uploads.reduce((a, u) => a + u.upload_length, 0),
   }));
 
@@ -35,7 +43,7 @@
     if (group === 'processing') list = list.filter(u => u.status === 'Processing');
     if (group === 'finalized')  list = list.filter(u => u.status === 'Finalized');
     if (group === 'failed')     list = list.filter(u => FAILED.includes(u.status));
-    if (group === 'abandoned')  list = list.filter(u => u.status === 'Abandoned');
+    if (group === 'abandoned')  list = list.filter(u => ABANDONED.includes(u.status));
     if (search) {
       const q = search.toLowerCase();
       list = list.filter(u => (u.filename ?? '').toLowerCase().includes(q) || u.id.includes(q));
@@ -47,17 +55,29 @@
     filtered.length > 0 && filtered.every(u => selected.has(u.id))
   );
 
-  async function load() {
+  async function load(limit = pageLimit) {
     try {
-      uploads = await api.listUploads();
+      uploads = await api.listUploads({ limit });
       lastRefresh = new Date();
       error = null;
     } catch (e) { error = String(e); }
     finally { loading = false; }
   }
 
+  let contextMap = $derived(
+    new Map(contexts.map(c => [c.id, c]))
+  );
+
+  async function loadMore() {
+    loadingMore = true;
+    pageLimit += PAGE_SIZE;
+    await load(pageLimit);
+    loadingMore = false;
+  }
+
   onMount(() => {
     load();
+    api.listContexts().then(c => { contexts = c; }).catch(() => {});
     const t = setInterval(() => { if (autoRefresh) load(); }, 3000);
     return () => clearInterval(t);
   });
@@ -115,7 +135,7 @@
   async function purgeGroup(g: Group) {
     const targets = uploads.filter(u => {
       if (g === 'finalized') return u.status === 'Finalized';
-      if (g === 'abandoned') return u.status === 'Abandoned';
+      if (g === 'abandoned') return ABANDONED.includes(u.status);
       if (g === 'failed')    return FAILED.includes(u.status);
       return false;
     });
@@ -140,6 +160,7 @@
   }
 
   function pct(u: Upload) {
+    if (u.length_is_deferred) return 0;
     return u.upload_length > 0 ? Math.round((u.upload_offset / u.upload_length) * 100) : 0;
   }
 
@@ -175,16 +196,18 @@
     { label: '10 MB',  bytes: 10 * 1024 * 1024 },
     { label: '25 MB',  bytes: 25 * 1024 * 1024 },
   ];
-  let chunkSize = $state(1 * 1024 * 1024); // default 1 MB
+  let chunkSize = $state(1 * 1024 * 1024);
 
-  let uploaderOpen   = $state(false);
-  let uploadFile     = $state<File | null>(null);
-  let uploadProgress = $state(0);       // 0–1
-  let uploadStatus   = $state<'idle' | 'uploading' | 'done' | 'error'>('idle');
-  let uploadError    = $state('');
-  let uploadedId     = $state('');
-  let uploadAbort    = $state<AbortController | null>(null);
-  let dropActive     = $state(false);
+  let uploaderOpen      = $state(false);
+  let uploadFile        = $state<File | null>(null);
+  let uploadProgress    = $state(0);
+  let uploadStatus      = $state<'idle' | 'uploading' | 'done' | 'error'>('idle');
+  let uploadError       = $state('');
+  let uploadedId        = $state('');
+  let uploadAbort       = $state<AbortController | null>(null);
+  let dropActive        = $state(false);
+  let uploadContextId   = $state('');   // '' = global /files
+  let uploadApiKey      = $state('');
 
   function onFileChange(e: Event) {
     const input = e.target as HTMLInputElement;
@@ -198,6 +221,13 @@
     uploadStatus = 'idle'; uploadError = ''; uploadedId = ''; uploadProgress = 0;
   }
 
+  async function uploadErrorMsg(res: Response, ctx: string): Promise<string> {
+    const body = await res.text().catch(() => '');
+    if (res.status === 507) return `Quota exceeded — ${body || 'storage or upload limit reached'}`;
+    if (res.status === 429) return 'Rate limited — too many requests, please try again shortly';
+    return `${ctx}: HTTP ${res.status}${body ? ` — ${body}` : ''}`;
+  }
+
   async function startUpload() {
     if (!uploadFile) return;
     const file = uploadFile;
@@ -208,29 +238,37 @@
     uploadedId = '';
     uploadProgress = 0;
 
+    const selectedCtx = uploadContextId ? contextMap.get(uploadContextId) : null;
+    const endpoint = selectedCtx ? `/${selectedCtx.slug}/files` : '/files';
+    const authHeaders: Record<string, string> = selectedCtx && uploadApiKey
+      ? { 'Authorization': `Bearer ${uploadApiKey}` }
+      : {};
+
     try {
-      // 1. Create upload
       const bytes = new TextEncoder().encode(file.name);
       let binary = '';
       bytes.forEach(b => (binary += String.fromCharCode(b)));
       const metaValue = btoa(binary);
-      const createRes = await fetch('/files', {
+      const createRes = await fetch(endpoint, {
         method: 'POST',
         signal: ac.signal,
         headers: {
           'Tus-Resumable': '1.0.0',
           'Upload-Length': String(file.size),
           'Upload-Metadata': `filename ${metaValue}`,
+          ...authHeaders,
         },
       });
-      if (!createRes.ok) throw new Error(`Create failed: ${createRes.status}`);
+      if (!createRes.ok) {
+        uploadError = await uploadErrorMsg(createRes, 'Create failed');
+        uploadStatus = 'error';
+        return;
+      }
       const location = createRes.headers.get('Location');
       if (!location) throw new Error('No Location header in response');
 
-      // Extract upload ID from location path
       uploadedId = location.split('/').pop() ?? '';
 
-      // 2. Upload chunks
       let offset = 0;
       while (offset < file.size) {
         const end = Math.min(offset + chunkSize, file.size);
@@ -243,16 +281,21 @@
             'Content-Type': 'application/offset+octet-stream',
             'Upload-Offset': String(offset),
             'Content-Length': String(chunk.size),
+            ...authHeaders,
           },
           body: chunk,
         });
-        if (!patchRes.ok) throw new Error(`Chunk upload failed: ${patchRes.status}`);
+        if (!patchRes.ok) {
+          uploadError = await uploadErrorMsg(patchRes, 'Upload failed');
+          uploadStatus = 'error';
+          return;
+        }
         offset = parseInt(patchRes.headers.get('Upload-Offset') ?? String(end), 10);
         uploadProgress = file.size > 0 ? offset / file.size : 1;
       }
 
       uploadStatus = 'done';
-      load(); // refresh table
+      load();
     } catch (e: unknown) {
       if ((e as Error).name === 'AbortError') {
         uploadStatus = 'idle';
@@ -308,7 +351,7 @@
 <div class="toolbar">
   <div class="search-wrap">
     <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="8.5" cy="8.5" r="5.25"/><path d="M13 13l3.5 3.5" stroke-linecap="round"/></svg>
-    <input class="search" placeholder="Search filename or ID…" bind:value={search} />
+    <input class="search" placeholder="Search filename or ID…" bind:value={search} autocomplete="off" />
     {#if search}<button class="clear-btn" onclick={() => search = ''}>✕</button>{/if}
   </div>
   <div class="toolbar-right">
@@ -317,7 +360,7 @@
       <input type="checkbox" bind:checked={autoRefresh} />
       <span>Auto-refresh</span>
     </label>
-    <button class="btn" onclick={load} disabled={loading}>↻ Refresh</button>
+    <button class="btn" onclick={() => load()} disabled={loading}>↻ Refresh</button>
   </div>
 </div>
 
@@ -335,7 +378,6 @@
 
   {#if uploaderOpen}
     <div class="uploader">
-      <!-- drop zone -->
       <div
         class="drop-zone"
         class:drag-over={dropActive}
@@ -361,7 +403,31 @@
         <input id="file-input" type="file" style="display:none" onchange={onFileChange} />
       </div>
 
-      <!-- chunk size -->
+      <div class="chunk-row">
+        <label for="ctx-select" class="chunk-label">Context</label>
+        <select id="ctx-select" class="chunk-select" bind:value={uploadContextId} disabled={uploadStatus === 'uploading'}>
+          <option value="">Global (/files)</option>
+          {#each contexts as c}
+            <option value={c.id}>{c.display_name} (/{c.slug}/files)</option>
+          {/each}
+        </select>
+      </div>
+
+      {#if uploadContextId}
+        <div class="chunk-row">
+          <label for="apikey-input" class="chunk-label">API key</label>
+          <input
+            id="apikey-input"
+            type="password"
+            class="apikey-input"
+            placeholder="Context API key…"
+            bind:value={uploadApiKey}
+            disabled={uploadStatus === 'uploading'}
+            autocomplete="new-password"
+          />
+        </div>
+      {/if}
+
       <div class="chunk-row">
         <label for="chunk-select" class="chunk-label">Chunk size</label>
         <select id="chunk-select" class="chunk-select" bind:value={chunkSize} disabled={uploadStatus === 'uploading'}>
@@ -371,7 +437,6 @@
         </select>
       </div>
 
-      <!-- progress -->
       {#if uploadStatus === 'uploading'}
         <div class="up-progress">
           <div class="up-bar"><div class="up-fill" style="width:{Math.round(uploadProgress * 100)}%"></div></div>
@@ -380,7 +445,6 @@
         </div>
       {/if}
 
-      <!-- status messages -->
       {#if uploadStatus === 'done'}
         <div class="up-msg ok">
           Upload complete —
@@ -391,7 +455,6 @@
         <div class="up-msg err">{uploadError}</div>
       {/if}
 
-      <!-- actions -->
       <div class="up-actions">
         {#if uploadStatus === 'uploading'}
           <button class="btn-up cancel" onclick={cancelUpload}>Cancel</button>
@@ -414,13 +477,9 @@
   <div class="bulk-bar">
     <span class="bulk-count">{selected.size} selected</span>
     <div class="bulk-actions">
-      <button class="btn-bulk abandon" onclick={bulkAbandon} disabled={bulkWorking}>
-        ⊘ Abandon
-      </button>
-      <button class="btn-bulk delete" onclick={bulkDelete} disabled={bulkWorking}>
-        ✕ Delete
-      </button>
-      <button class="btn-bulk clear" onclick={clearSelection}>Deselect all</button>
+      <button class="btn-bulk abandon" onclick={bulkAbandon} disabled={bulkWorking}>⊘ Abandon</button>
+      <button class="btn-bulk delete"  onclick={bulkDelete}  disabled={bulkWorking}>✕ Delete</button>
+      <button class="btn-bulk clear"   onclick={clearSelection}>Deselect all</button>
     </div>
   </div>
 {/if}
@@ -439,6 +498,7 @@
             <input type="checkbox" checked={allSelected} onchange={toggleAll} />
           </th>
           <th>File</th>
+          <th>Context</th>
           <th>Status</th>
           <th>Progress</th>
           <th>Size</th>
@@ -454,27 +514,55 @@
               <input type="checkbox" checked={selected.has(u.id)} onchange={() => toggleRow(u.id)} />
             </td>
             <td class="col-file">
-              <span class="filename">{u.filename ?? '(unnamed)'}</span>
+              <div class="file-name-row">
+                <span class="filename">{u.filename ?? '(unnamed)'}</span>
+                {#if u.concat_type === 'partial'}<span class="chip partial">partial</span>{/if}
+                {#if u.concat_type === 'final'}<span class="chip concat">concat</span>{/if}
+                {#if u.length_is_deferred}<span class="chip deferred">deferred</span>{/if}
+              </div>
               <span class="upload-id">{u.id.slice(0, 8)}…</span>
             </td>
-            <td><span class="badge {u.status.toLowerCase()}">{u.status}</span></td>
+            <td class="col-ctx">
+              {#if u.context_id && contextMap.get(u.context_id)}
+                <span class="ctx-slug">{contextMap.get(u.context_id)!.slug}</span>
+              {:else}
+                <span class="dim small">global</span>
+              {/if}
+            </td>
+            <td><span class="badge {u.status.toLowerCase().replace('_','')}">{u.status}</span></td>
             <td>
-              <div class="col-prog">
-                <div class="bar"><div class="fill" style="width:{pct(u)}%"></div></div>
-                <span class="pct">{pct(u)}%</span>
-              </div>
+              {#if u.length_is_deferred}
+                <span class="dim small">unknown size</span>
+              {:else}
+                <div class="col-prog">
+                  <div class="bar"><div class="fill" style="width:{pct(u)}%"></div></div>
+                  <span class="pct">{pct(u)}%</span>
+                </div>
+              {/if}
             </td>
             <td class="mono">
-              {#if u.upload_offset < u.upload_length && !['Finalized','Abandoned'].includes(u.status)}
-                <span class="dim">{fmt(u.upload_offset)} /</span>
+              {#if u.length_is_deferred}
+                <span class="dim">deferred</span>
+              {:else if u.upload_offset < u.upload_length && !['Finalized','Abandoned','ConsumedByConcat'].includes(u.status)}
+                <span class="dim">{fmt(u.upload_offset)} /</span> {fmt(u.upload_length)}
+              {:else}
+                {fmt(u.upload_length)}
               {/if}
-              {fmt(u.upload_length)}
             </td>
             <td class="mono dim small">{reltime(u.created_at)}</td>
             <td class="mono dim small">{reltime(u.updated_at)}</td>
             <td class="col-actions">
-              <a href="/uploads/{u.id}" class="btn-link">Detail</a>
-              <button class="btn-icon danger" title="Delete" onclick={() => deleteSingle(u.id)}>✕</button>
+              <div class="actions-wrap">
+                <a href="/uploads/{u.id}" class="btn-link">Detail</a>
+                {#if u.status === 'Finalized'}
+                  <a href="/files/{u.id}" download class="btn-icon" title="Download">
+                    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" width="13" height="13">
+                      <path d="M8 2v8M5 7l3 3 3-3"/><path d="M2 13h12"/>
+                    </svg>
+                  </a>
+                {/if}
+                <button class="btn-icon danger" title="Delete" onclick={() => deleteSingle(u.id)}>✕</button>
+              </div>
             </td>
           </tr>
         {/each}
@@ -482,8 +570,12 @@
     </table>
   </div>
   <div class="footer">
-    Showing {filtered.length} of {uploads.length} upload{uploads.length !== 1 ? 's' : ''}
-    · {fmt(stats.bytes)} total
+    <span>Showing {filtered.length} of {uploads.length} upload{uploads.length !== 1 ? 's' : ''} · {fmt(stats.bytes)} total</span>
+    {#if mayHaveMore}
+      <button class="btn-more" onclick={loadMore} disabled={loadingMore}>
+        {loadingMore ? 'Loading…' : 'Load more'}
+      </button>
+    {/if}
   </div>
 {/if}
 
@@ -593,36 +685,54 @@
   .col-check { width: 36px; padding-right: 0; }
   .col-check input { cursor: pointer; accent-color: #3b82f6; }
 
-  .col-file { width: 220px; }
-  .filename { display: block; font-weight: 500; }
+  .col-file { width: 240px; }
+  .file-name-row { display: flex; align-items: center; gap: 0.35rem; flex-wrap: wrap; }
+  .filename { font-weight: 500; }
   .upload-id { display: block; font-size: 0.7rem; font-family: monospace; color: #475569; margin-top: 0.1rem; }
+
+  .chip {
+    font-size: 0.6rem; font-weight: 600; padding: 0.1rem 0.35rem;
+    border-radius: 3px; text-transform: uppercase; letter-spacing: 0.04em; white-space: nowrap;
+  }
+  .chip.partial  { background: #2a1f3a; color: #c084fc; }
+  .chip.concat   { background: #1a2f3a; color: #67e8f9; }
+  .chip.deferred { background: #1a2a3a; color: #7dd3fc; }
 
   .col-prog { display: flex; align-items: center; gap: 0.5rem; width: 180px; }
   .bar { flex: 1; height: 6px; background: #2d3148; border-radius: 3px; overflow: hidden; }
   .fill { height: 100%; background: #3b82f6; border-radius: 3px; transition: width 0.4s; }
   .pct { font-size: 0.75rem; color: #94a3b8; width: 2.5rem; text-align: right; font-family: monospace; flex-shrink: 0; }
 
-  .col-actions { white-space: nowrap; display: flex; align-items: center; gap: 0.5rem; }
+  .col-actions { white-space: nowrap; vertical-align: middle; }
+  .actions-wrap { display: flex; align-items: center; gap: 0.5rem; }
   .btn-link { font-size: 0.8rem; color: #60a5fa; white-space: nowrap; }
   .btn-link:hover { text-decoration: underline; }
   .btn-icon {
     background: none; border: none; cursor: pointer;
     font-size: 0.75rem; padding: 0.2rem 0.4rem; border-radius: 3px; opacity: 0.5;
     transition: opacity 0.15s, background 0.15s;
+    display: inline-flex; align-items: center; justify-content: center;
+    text-decoration: none; color: inherit;
   }
   .btn-icon:hover { opacity: 1; }
   .btn-icon.danger:hover { background: #3a1a1a; color: #f87171; }
+  a.btn-icon:hover { background: #1a2f1a; color: #4ade80; }
   tr:hover .btn-icon { opacity: 0.7; }
 
   .mono { font-family: monospace; white-space: nowrap; }
   .dim { color: #64748b; }
   .small { font-size: 0.8rem; }
 
-  .footer { margin-top: 0.75rem; font-size: 0.8rem; color: #475569; text-align: right; }
+  .footer { margin-top: 0.75rem; font-size: 0.8rem; color: #475569; display: flex; justify-content: space-between; align-items: center; }
+  .btn-more {
+    padding: 0.3rem 0.875rem; background: #2d3148; color: #94a3b8;
+    border: 1px solid #3d4263; border-radius: 5px; cursor: pointer; font-size: 0.8rem;
+  }
+  .btn-more:hover:not(:disabled) { background: #363b5a; color: #e2e8f0; }
+  .btn-more:disabled { opacity: 0.5; cursor: default; }
 
   /* ── test uploader ── */
   .uploader-wrap { margin-bottom: 1rem; }
-
   .uploader-toggle {
     display: flex; align-items: center; gap: 0.4rem;
     background: none; border: none; cursor: pointer;
@@ -630,16 +740,13 @@
     transition: color 0.15s;
   }
   .uploader-toggle:hover { color: #e2e8f0; }
-
   .chevron { width: 14px; height: 14px; transition: transform 0.2s; }
   .chevron.open { transform: rotate(180deg); }
-
   .uploader {
     margin-top: 0.5rem;
     background: #1e2130; border: 1px solid #2d3148; border-radius: 8px;
     padding: 1rem; display: flex; flex-direction: column; gap: 0.75rem;
   }
-
   .drop-zone {
     border: 2px dashed #2d3148; border-radius: 6px;
     padding: 1.5rem; text-align: center;
@@ -653,7 +760,6 @@
   .drop-icon { width: 28px; height: 28px; margin-bottom: 0.25rem; }
   .drop-file { font-weight: 600; color: #e2e8f0; font-size: 0.9rem; }
   .drop-size { font-size: 0.775rem; color: #64748b; }
-
   .chunk-row { display: flex; align-items: center; gap: 0.75rem; }
   .chunk-label { font-size: 0.8rem; color: #64748b; white-space: nowrap; }
   .chunk-select {
@@ -661,22 +767,32 @@
     color: #e2e8f0; font-size: 0.8rem; padding: 0.25rem 0.5rem; cursor: pointer;
   }
   .chunk-select:disabled { opacity: 0.4; cursor: not-allowed; }
+  .apikey-input {
+    flex: 1; background: #161824; border: 1px solid #2d3148; border-radius: 5px;
+    color: #e2e8f0; font-size: 0.8rem; padding: 0.25rem 0.5rem;
+    font-family: monospace;
+  }
+  .apikey-input:disabled { opacity: 0.4; cursor: not-allowed; }
+  .apikey-input::placeholder { color: #475569; }
 
+  .col-ctx { white-space: nowrap; }
+  .ctx-slug {
+    font-size: 0.75rem; font-family: monospace;
+    background: #1a2f3a; color: #67e8f9;
+    padding: 0.1rem 0.4rem; border-radius: 3px;
+  }
   .up-progress { display: flex; align-items: center; gap: 0.75rem; }
   .up-bar { flex: 1; height: 6px; background: #2d3148; border-radius: 3px; overflow: hidden; }
   .up-fill { height: 100%; background: #3b82f6; border-radius: 3px; transition: width 0.2s; }
   .up-pct { font-size: 0.75rem; font-family: monospace; color: #94a3b8; width: 2.5rem; text-align: right; }
   .up-bytes { font-size: 0.75rem; color: #64748b; font-family: monospace; }
-
   .up-msg { font-size: 0.825rem; padding: 0.5rem 0.75rem; border-radius: 5px; }
   .up-msg.ok  { background: #1a2f1a; color: #4ade80; display: flex; align-items: center; gap: 0.5rem; }
-  .up-msg.err { background: #3a1a1a; color: #f87171; }
-
+  .up-msg.err { background: #3b1a1a; color: #f87171; }
   .up-again {
     background: none; border: none; color: #60a5fa; font-size: 0.8rem;
     cursor: pointer; padding: 0; text-decoration: underline;
   }
-
   .up-actions { display: flex; gap: 0.5rem; }
   .btn-up {
     padding: 0.4rem 1rem; border-radius: 6px; cursor: pointer;
@@ -693,13 +809,14 @@
     display: inline-block; padding: 0.2rem 0.55rem; border-radius: 4px;
     font-size: 0.72rem; font-weight: 600; white-space: nowrap;
   }
-  .badge.created          { background: #1e2a3a; color: #93c5fd; }
-  .badge.uploading        { background: #1e3a5f; color: #60a5fa; }
-  .badge.completed        { background: #1a3a2a; color: #86efac; }
-  .badge.processing       { background: #3a2e1a; color: #fcd34d; }
-  .badge.finalized        { background: #1a2f1a; color: #4ade80; }
+  .badge.created              { background: #1e2a3a; color: #93c5fd; }
+  .badge.uploading            { background: #1e3a5f; color: #60a5fa; }
+  .badge.completed            { background: #1a3a2a; color: #86efac; }
+  .badge.processing           { background: #3a2e1a; color: #fcd34d; }
+  .badge.finalized            { background: #1a2f1a; color: #4ade80; }
   .badge.failedupload,
   .badge.failedprocessing,
-  .badge.failedfinalization { background: #3a1a1a; color: #f87171; }
-  .badge.abandoned        { background: #1e2130; color: #475569; }
+  .badge.failedfinalization   { background: #3a1a1a; color: #f87171; }
+  .badge.abandoned            { background: #1e2130; color: #475569; }
+  .badge.consumedbyconcat     { background: #1f1a2e; color: #a78bfa; }
 </style>

@@ -11,6 +11,9 @@ pub enum UploadStatus {
     FailedProcessing,
     FailedFinalization,
     Abandoned,
+    /// Partial upload whose bytes were merged into a concat-final upload.
+    /// Distinct from Abandoned so the dashboard can show the correct reason.
+    ConsumedByConcat,
 }
 
 impl UploadStatus {
@@ -39,6 +42,7 @@ impl std::fmt::Display for UploadStatus {
             Self::FailedProcessing => "FailedProcessing",
             Self::FailedFinalization => "FailedFinalization",
             Self::Abandoned => "Abandoned",
+            Self::ConsumedByConcat => "ConsumedByConcat",
         };
         write!(f, "{s}")
     }
@@ -58,6 +62,7 @@ impl TryFrom<String> for UploadStatus {
             "FailedProcessing" => Ok(Self::FailedProcessing),
             "FailedFinalization" => Ok(Self::FailedFinalization),
             "Abandoned" => Ok(Self::Abandoned),
+            "ConsumedByConcat" => Ok(Self::ConsumedByConcat),
             _ => Err(format!("unknown status: {s}")),
         }
     }
@@ -79,6 +84,7 @@ pub struct Upload {
     pub length_is_deferred: bool,
     pub concat_type: Option<String>,
     pub concat_uploads: Option<String>,
+    pub context_id: Option<String>,
 }
 
 impl Upload {
@@ -101,6 +107,7 @@ pub struct NewUpload {
     pub length_is_deferred: bool,
     pub concat_type: Option<String>,
     pub concat_uploads: Option<String>,
+    pub context_id: Option<String>,
 }
 
 #[cfg(test)]
@@ -123,6 +130,7 @@ mod tests {
             length_is_deferred: false,
             concat_type: None,
             concat_uploads: None,
+            context_id: None,
         }
     }
 
@@ -153,4 +161,5 @@ pub struct UploadEvent {
     pub event_type: String,
     pub message: Option<String>,
     pub created_at: String,
+    pub context_id: Option<String>,
 }

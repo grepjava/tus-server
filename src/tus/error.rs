@@ -9,6 +9,12 @@ pub enum TusError {
     #[error("upload not found")]
     NotFound,
 
+    #[error("unauthorized")]
+    Unauthorized,
+
+    #[error("forbidden")]
+    Forbidden,
+
     #[error("offset mismatch: expected {expected}, got {actual}")]
     OffsetMismatch { expected: i64, actual: i64 },
 
@@ -33,6 +39,9 @@ pub enum TusError {
     #[error("upload has expired")]
     Expired,
 
+    #[error("quota exceeded: {0}")]
+    QuotaExceeded(String),
+
     #[error("checksum mismatch")]
     ChecksumMismatch,
 
@@ -53,6 +62,8 @@ impl IntoResponse for TusError {
     fn into_response(self) -> Response {
         let status = match &self {
             TusError::NotFound => StatusCode::NOT_FOUND,
+            TusError::Unauthorized => StatusCode::UNAUTHORIZED,
+            TusError::Forbidden => StatusCode::FORBIDDEN,
             TusError::OffsetMismatch { .. } => StatusCode::CONFLICT,
             TusError::UnsupportedVersion(_) => StatusCode::PRECONDITION_FAILED,
             TusError::MissingHeader(_) => StatusCode::BAD_REQUEST,
@@ -61,6 +72,7 @@ impl IntoResponse for TusError {
             TusError::ExceedsUploadLength => StatusCode::PAYLOAD_TOO_LARGE,
             TusError::InvalidContentType => StatusCode::UNSUPPORTED_MEDIA_TYPE,
             TusError::Expired => StatusCode::GONE,
+            TusError::QuotaExceeded(_) => StatusCode::INSUFFICIENT_STORAGE,
             TusError::ChecksumMismatch => StatusCode::from_u16(460).expect("460 is valid"),
             TusError::UnsupportedChecksumAlgorithm(_) => StatusCode::BAD_REQUEST,
             TusError::Storage(_) => StatusCode::INTERNAL_SERVER_ERROR,

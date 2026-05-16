@@ -4,7 +4,10 @@ use futures::StreamExt;
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
-use tokio::{fs, io::AsyncWriteExt};
+use tokio::{
+    fs,
+    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
+};
 
 use super::error::TusError;
 
@@ -20,6 +23,56 @@ pub trait StorageBackend: Send + Sync {
     async fn finalize(&self, path: &str, filename: Option<&str>) -> Result<String, TusError>;
     async fn delete(&self, path: &str) -> Result<(), TusError>;
     async fn concat_files(&self, dest_path: &str, source_paths: &[String]) -> Result<u64, TusError>;
+    async fn health(&self) -> Result<(), TusError>;
+    /// Called before accepting a new upload. Implementations that stage data on local
+    /// disk should verify at least `required_bytes` are available. Default is a no-op.
+    async fn check_staging_capacity(&self, _required_bytes: u64) -> Result<(), TusError> {
+        Ok(())
+    }
+    /// Stream `length` bytes from `path` beginning at `offset`.
+    async fn open_for_read(&self, path: &str, offset: u64, length: u64) -> Result<Body, TusError>;
+}
+
+/// Streams `body` into `path`, computing and verifying `checksum` if provided.
+/// On checksum failure the file is truncated back to its pre-call length.
+pub(crate) async fn write_body_to_file(
+    path: &std::path::Path,
+    body: Body,
+    checksum: Option<(String, Vec<u8>)>,
+) -> Result<u64, TusError> {
+    let original_len = fs::metadata(path).await.map(|m| m.len()).unwrap_or(0);
+
+    let mut hasher = checksum
+        .as_ref()
+        .map(|(alg, _)| ChecksumHasher::from_algorithm(alg))
+        .transpose()?;
+
+    let file = fs::OpenOptions::new().append(true).open(path).await?;
+    let mut writer = tokio::io::BufWriter::new(file);
+    let mut stream = body.into_data_stream();
+    let mut bytes_written: u64 = 0;
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| TusError::Internal(anyhow::anyhow!(e)))?;
+        if let Some(h) = hasher.as_mut() {
+            h.update(&chunk);
+        }
+        writer.write_all(&chunk).await?;
+        bytes_written += chunk.len() as u64;
+    }
+    writer.flush().await?;
+
+    if let Some((_, expected)) = checksum {
+        let computed = hasher.unwrap().finalize();
+        if computed != expected {
+            if let Ok(f) = fs::OpenOptions::new().write(true).open(path).await {
+                let _ = f.set_len(original_len).await;
+            }
+            return Err(TusError::ChecksumMismatch);
+        }
+    }
+
+    Ok(bytes_written)
 }
 
 pub struct FilesystemStorage {
@@ -36,7 +89,7 @@ impl FilesystemStorage {
     }
 }
 
-fn sanitize_filename(name: &str) -> String {
+pub(crate) fn sanitize_filename(name: &str) -> String {
     // Allowlist: letters, digits, spaces, dots, underscores, hyphens
     let sanitized: String = name
         .chars()
@@ -97,40 +150,7 @@ impl StorageBackend for FilesystemStorage {
         body: Body,
         checksum: Option<(String, Vec<u8>)>,
     ) -> Result<u64, TusError> {
-        let full = self.full_path(path);
-        let original_len = fs::metadata(&full).await.map(|m| m.len()).unwrap_or(0);
-
-        let mut hasher = checksum
-            .as_ref()
-            .map(|(alg, _)| ChecksumHasher::from_algorithm(alg))
-            .transpose()?;
-
-        let file = fs::OpenOptions::new().append(true).open(&full).await?;
-        let mut writer = tokio::io::BufWriter::new(file);
-        let mut stream = body.into_data_stream();
-        let mut bytes_written: u64 = 0;
-
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|e| TusError::Internal(anyhow::anyhow!(e)))?;
-            if let Some(h) = hasher.as_mut() {
-                h.update(&chunk);
-            }
-            writer.write_all(&chunk).await?;
-            bytes_written += chunk.len() as u64;
-        }
-        writer.flush().await?;
-
-        if let Some((_, expected)) = checksum {
-            let computed = hasher.unwrap().finalize();
-            if computed != expected {
-                if let Ok(f) = fs::OpenOptions::new().write(true).open(&full).await {
-                    let _ = f.set_len(original_len).await;
-                }
-                return Err(TusError::ChecksumMismatch);
-            }
-        }
-
-        Ok(bytes_written)
+        write_body_to_file(&self.full_path(path), body, checksum).await
     }
 
     async fn finalize(&self, path: &str, filename: Option<&str>) -> Result<String, TusError> {
@@ -187,6 +207,24 @@ impl StorageBackend for FilesystemStorage {
 
         dest_file.flush().await?;
         Ok(total)
+    }
+
+    async fn health(&self) -> Result<(), TusError> {
+        fs::create_dir_all(&self.base_dir).await?;
+        let probe = self.base_dir.join(".health_probe");
+        fs::write(&probe, b"").await?;
+        fs::remove_file(&probe).await?;
+        Ok(())
+    }
+
+    async fn open_for_read(&self, path: &str, offset: u64, length: u64) -> Result<Body, TusError> {
+        let full = self.full_path(path);
+        let mut file = fs::File::open(&full).await?;
+        if offset > 0 {
+            file.seek(std::io::SeekFrom::Start(offset)).await?;
+        }
+        let stream = tokio_util::io::ReaderStream::new(file.take(length));
+        Ok(Body::from_stream(stream))
     }
 }
 

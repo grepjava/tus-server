@@ -17,10 +17,12 @@ pub trait UploadRepository: Send + Sync {
     async fn list(&self, limit: i64, offset: i64) -> Result<Vec<Upload>, TusError>;
     async fn list_completed(&self) -> Result<Vec<Upload>, TusError>;
     async fn find_stale(&self, older_than_hours: i64) -> Result<Vec<Upload>, TusError>;
-    async fn insert_event(&self, upload_id: &str, event_type: &str, message: Option<&str>) -> Result<(), TusError>;
+    async fn insert_event(&self, upload_id: &str, event_type: &str, message: Option<&str>, context_id: Option<&str>) -> Result<(), TusError>;
     async fn list_events(&self, upload_id: &str, limit: i64, offset: i64) -> Result<Vec<UploadEvent>, TusError>;
     async fn update_storage_path(&self, id: &str, path: &str) -> Result<(), TusError>;
     async fn delete_record(&self, id: &str) -> Result<(), TusError>;
+    async fn count_active_storage_bytes(&self) -> Result<i64, TusError>;
+    async fn count_active_uploads(&self) -> Result<i64, TusError>;
 }
 
 #[derive(FromRow)]
@@ -39,6 +41,7 @@ struct UploadRow {
     length_is_deferred: i64,
     concat_type: Option<String>,
     concat_uploads: Option<String>,
+    context_id: Option<String>,
 }
 
 fn row_to_upload(row: UploadRow) -> Result<Upload, TusError> {
@@ -59,6 +62,7 @@ fn row_to_upload(row: UploadRow) -> Result<Upload, TusError> {
         length_is_deferred: row.length_is_deferred != 0,
         concat_type: row.concat_type,
         concat_uploads: row.concat_uploads,
+        context_id: row.context_id,
     })
 }
 
@@ -74,7 +78,8 @@ impl SqliteUploadRepository {
 
 const COLS: &str =
     "id, filename, upload_length, upload_offset, metadata_json, status, storage_path, \
-     created_at, updated_at, completed_at, error_message, length_is_deferred, concat_type, concat_uploads";
+     created_at, updated_at, completed_at, error_message, length_is_deferred, concat_type, concat_uploads, \
+     context_id";
 
 #[async_trait]
 impl UploadRepository for SqliteUploadRepository {
@@ -85,8 +90,8 @@ impl UploadRepository for SqliteUploadRepository {
         sqlx::query(
             "INSERT INTO uploads \
              (id, filename, upload_length, upload_offset, metadata_json, status, storage_path, \
-              created_at, updated_at, length_is_deferred, concat_type, concat_uploads) \
-             VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?)",
+              created_at, updated_at, length_is_deferred, concat_type, concat_uploads, context_id) \
+             VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&upload.id)
         .bind(&upload.filename)
@@ -99,6 +104,7 @@ impl UploadRepository for SqliteUploadRepository {
         .bind(upload.length_is_deferred as i64)
         .bind(&upload.concat_type)
         .bind(&upload.concat_uploads)
+        .bind(&upload.context_id)
         .execute(&self.pool)
         .await?;
 
@@ -134,9 +140,18 @@ impl UploadRepository for SqliteUploadRepository {
         .rows_affected();
 
         if affected == 0 {
+            let actual: i64 = sqlx::query_scalar(
+                "SELECT upload_offset FROM uploads WHERE id = ?",
+            )
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or(old_offset);
             return Err(TusError::OffsetMismatch {
                 expected: old_offset,
-                actual: old_offset,
+                actual,
             });
         }
 
@@ -231,18 +246,20 @@ impl UploadRepository for SqliteUploadRepository {
         rows.into_iter().map(row_to_upload).collect()
     }
 
-    async fn insert_event(&self, upload_id: &str, event_type: &str, message: Option<&str>) -> Result<(), TusError> {
+    async fn insert_event(&self, upload_id: &str, event_type: &str, message: Option<&str>, context_id: Option<&str>) -> Result<(), TusError> {
         let id = Uuid::new_v4().to_string();
         let now = Utc::now().to_rfc3339();
 
         sqlx::query(
-            "INSERT INTO upload_events (id, upload_id, event_type, message, created_at) VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO upload_events (id, upload_id, event_type, message, created_at, context_id) \
+             VALUES (?, ?, ?, ?, ?, ?)",
         )
         .bind(&id)
         .bind(upload_id)
         .bind(event_type)
         .bind(message)
         .bind(&now)
+        .bind(context_id)
         .execute(&self.pool)
         .await?;
 
@@ -251,7 +268,7 @@ impl UploadRepository for SqliteUploadRepository {
 
     async fn list_events(&self, upload_id: &str, limit: i64, offset: i64) -> Result<Vec<UploadEvent>, TusError> {
         let events = sqlx::query_as::<_, UploadEvent>(
-            "SELECT id, upload_id, event_type, message, created_at \
+            "SELECT id, upload_id, event_type, message, created_at, context_id \
              FROM upload_events WHERE upload_id = ? ORDER BY created_at ASC LIMIT ? OFFSET ?",
         )
         .bind(upload_id)
@@ -284,5 +301,25 @@ impl UploadRepository for SqliteUploadRepository {
             .execute(&self.pool)
             .await?;
         Ok(())
+    }
+
+    async fn count_active_storage_bytes(&self) -> Result<i64, TusError> {
+        let n = sqlx::query_scalar::<_, i64>(
+            "SELECT COALESCE(SUM(upload_length), 0) FROM uploads \
+             WHERE status NOT IN ('Abandoned', 'ConsumedByConcat') \
+               AND length_is_deferred = 0",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(n)
+    }
+
+    async fn count_active_uploads(&self) -> Result<i64, TusError> {
+        let n = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM uploads WHERE status IN ('Created', 'Uploading')",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(n)
     }
 }

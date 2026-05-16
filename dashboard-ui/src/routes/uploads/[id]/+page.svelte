@@ -88,6 +88,7 @@
   }
 
   function pct(u: Upload) {
+    if (u.length_is_deferred) return 0;
     return u.upload_length > 0 ? Math.round((u.upload_offset / u.upload_length) * 100) : 0;
   }
 
@@ -95,7 +96,7 @@
     return ['FailedProcessing', 'FailedFinalization'].includes(u.status);
   }
   function canAbandon(u: Upload) {
-    return !['Finalized', 'Abandoned'].includes(u.status);
+    return !['Finalized', 'Abandoned', 'ConsumedByConcat'].includes(u.status);
   }
   function isActive(u: Upload) {
     return ['Created', 'Uploading'].includes(u.status);
@@ -104,6 +105,12 @@
   let metadata = $derived.by(() => {
     if (!upload?.metadata_json) return null;
     try { return JSON.parse(upload.metadata_json) as Record<string, string>; }
+    catch { return null; }
+  });
+
+  let concatPartials = $derived.by(() => {
+    if (!upload?.concat_uploads) return null;
+    try { return JSON.parse(upload.concat_uploads) as string[]; }
     catch { return null; }
   });
 
@@ -120,22 +127,16 @@
     retry_queued:       '#f97316',
   };
 
-  function evColor(type: string) {
-    return EV_COLORS[type] ?? '#94a3b8';
-  }
+  function evColor(type: string) { return EV_COLORS[type] ?? '#94a3b8'; }
+  function evLabel(type: string) { return type.replace(/_/g, ' '); }
 
-  function evLabel(type: string) {
-    return type.replace(/_/g, ' ');
-  }
-
-  // group consecutive chunk_received into one summary line
   let displayEvents = $derived.by(() => {
     const out: Array<{ ev: UploadEvent; count: number }> = [];
     for (const ev of events) {
       const last = out[out.length - 1];
       if (ev.event_type === 'chunk_received' && last?.ev.event_type === 'chunk_received') {
         last.count++;
-        last.ev = ev; // keep latest so message shows final offset
+        last.ev = ev;
       } else {
         out.push({ ev, count: 1 });
       }
@@ -160,15 +161,25 @@
   <!-- ── header ── -->
   <div class="header">
     <div class="header-left">
-      <h1>{upload.filename ?? '(unnamed)'}</h1>
+      <div class="title-row">
+        <h1>{upload.filename ?? '(unnamed)'}</h1>
+        {#if upload.length_is_deferred}<span class="hbadge deferred">deferred length</span>{/if}
+        {#if upload.concat_type === 'partial'}<span class="hbadge partial">partial concat</span>{/if}
+        {#if upload.concat_type === 'final'}<span class="hbadge concat">final concat</span>{/if}
+      </div>
       <button class="id-chip" onclick={copyId} title="Click to copy">
         <code>{id}</code>
         <span>{copied ? '✓ copied' : 'copy'}</span>
       </button>
     </div>
     <div class="header-right">
-      <span class="badge {upload.status.toLowerCase()}">{upload.status}</span>
+      <span class="badge {upload.status.toLowerCase().replace('_','')}">
+        {upload.status === 'ConsumedByConcat' ? 'Consumed by concat' : upload.status}
+      </span>
       <div class="actions">
+        {#if upload.status === 'Finalized'}
+          <a href="/files/{id}" download class="btn download">↓ Download</a>
+        {/if}
         {#if canRetry(upload)}
           <button class="btn primary" onclick={retry}>↺ Retry</button>
         {/if}
@@ -190,14 +201,21 @@
     </div>
   {/if}
 
-  <!-- ── progress bar (prominent if active) ── -->
-  {#if isActive(upload) || upload.status === 'Uploading'}
+  <!-- ── progress bar ── -->
+  {#if isActive(upload)}
     <div class="prog-section">
       <div class="prog-header">
-        <span>{fmt(upload.upload_offset)} of {fmt(upload.upload_length)}</span>
-        <span class="pct">{pct(upload)}%</span>
+        {#if upload.length_is_deferred}
+          <span>{fmt(upload.upload_offset)} uploaded — final size not yet known</span>
+          <span class="pct">deferred</span>
+        {:else}
+          <span>{fmt(upload.upload_offset)} of {fmt(upload.upload_length)}</span>
+          <span class="pct">{pct(upload)}%</span>
+        {/if}
       </div>
-      <div class="prog-track"><div class="prog-fill animated" style="width:{pct(upload)}%"></div></div>
+      {#if !upload.length_is_deferred}
+        <div class="prog-track"><div class="prog-fill animated" style="width:{pct(upload)}%"></div></div>
+      {/if}
     </div>
   {/if}
 
@@ -206,40 +224,32 @@
     <!-- transfer -->
     <div class="card">
       <div class="card-title">Transfer</div>
-      <div class="stat-row">
-        <span>Total size</span>     <strong>{fmt(upload.upload_length)}</strong>
-      </div>
-      <div class="stat-row">
-        <span>Uploaded</span>       <strong>{fmt(upload.upload_offset)}</strong>
-      </div>
-      <div class="stat-row">
-        <span>Progress</span>       <strong>{pct(upload)}%</strong>
-      </div>
-      {#if upload.status !== 'Uploading' && upload.status !== 'Created'}
-        <div class="prog-mini">
-          <div class="prog-fill" style="width:{pct(upload)}%"></div>
-        </div>
+      {#if upload.length_is_deferred}
+        <div class="stat-row"><span>Total size</span><strong class="dim">unknown (deferred)</strong></div>
+      {:else}
+        <div class="stat-row"><span>Total size</span><strong>{fmt(upload.upload_length)}</strong></div>
+      {/if}
+      <div class="stat-row"><span>Uploaded</span><strong>{fmt(upload.upload_offset)}</strong></div>
+      {#if !upload.length_is_deferred}
+        <div class="stat-row"><span>Progress</span><strong>{pct(upload)}%</strong></div>
+        {#if upload.status !== 'Uploading' && upload.status !== 'Created'}
+          <div class="prog-mini"><div class="prog-fill" style="width:{pct(upload)}%"></div></div>
+        {/if}
       {/if}
     </div>
 
     <!-- timing -->
     <div class="card">
       <div class="card-title">Timing</div>
-      <div class="stat-row">
-        <span>Created</span>        <strong>{fmtDate(upload.created_at)}</strong>
-      </div>
-      <div class="stat-row">
-        <span>Last activity</span>  <strong>{reltime(upload.updated_at)}</strong>
-      </div>
+      <div class="stat-row"><span>Created</span><strong>{fmtDate(upload.created_at)}</strong></div>
+      <div class="stat-row"><span>Last activity</span><strong>{reltime(upload.updated_at)}</strong></div>
       {#if upload.completed_at}
-        <div class="stat-row">
-          <span>Completed</span>    <strong>{fmtDate(upload.completed_at)}</strong>
-        </div>
+        <div class="stat-row"><span>Completed</span><strong>{fmtDate(upload.completed_at)}</strong></div>
         <div class="stat-row">
           <span>Duration</span>
           <strong>{
             (() => {
-              const ms = new Date(upload.completed_at).getTime() - new Date(upload.created_at).getTime();
+              const ms = new Date(upload.completed_at!).getTime() - new Date(upload.created_at).getTime();
               return ms < 1000 ? `${ms}ms` : `${(ms/1000).toFixed(1)}s`;
             })()
           }</strong>
@@ -256,9 +266,39 @@
       </div>
       <div class="stat-row">
         <span>Status</span>
-        <span class="badge {upload.status.toLowerCase()}">{upload.status}</span>
+        <span class="badge {upload.status.toLowerCase().replace('_','')}">
+          {upload.status === 'ConsumedByConcat' ? 'Consumed' : upload.status}
+        </span>
       </div>
     </div>
+
+    <!-- concat info -->
+    {#if upload.concat_type}
+      <div class="card">
+        <div class="card-title">Concatenation</div>
+        <div class="stat-row">
+          <span>Type</span>
+          <span class="hbadge {upload.concat_type === 'final' ? 'concat' : 'partial'}">
+            {upload.concat_type}
+          </span>
+        </div>
+        {#if upload.concat_type === 'final' && concatPartials}
+          <div class="concat-label">Source uploads</div>
+          <ul class="concat-list">
+            {#each concatPartials as pid}
+              <li><a href="/uploads/{pid}">{pid.slice(0, 16)}…</a></li>
+            {/each}
+          </ul>
+        {:else if upload.concat_type === 'partial'}
+          <div class="stat-row">
+            <span>Status</span>
+            <span class="dim small">
+              {upload.status === 'ConsumedByConcat' ? 'Consumed by a final upload' : 'Awaiting concatenation'}
+            </span>
+          </div>
+        {/if}
+      </div>
+    {/if}
 
     <!-- metadata -->
     {#if metadata}
@@ -299,38 +339,30 @@
 {/if}
 
 <style>
-  .topbar {
-    display: flex; align-items: center; justify-content: space-between;
-    margin-bottom: 1.25rem;
-  }
+  .topbar { display: flex; align-items: center; justify-content: space-between; margin-bottom: 1.25rem; }
   .back { font-size: 0.875rem; color: #60a5fa; }
   .back:hover { text-decoration: underline; }
 
-  .live-indicator {
-    display: flex; align-items: center; gap: 0.375rem;
-    font-size: 0.75rem; color: #475569;
-  }
+  .live-indicator { display: flex; align-items: center; gap: 0.375rem; font-size: 0.75rem; color: #475569; }
   .live-indicator.on { color: #4ade80; }
-  .dot {
-    width: 7px; height: 7px; border-radius: 50%; background: #475569;
-    transition: background 0.3s;
-  }
+  .dot { width: 7px; height: 7px; border-radius: 50%; background: #475569; transition: background 0.3s; }
   .live-indicator.on .dot { background: #4ade80; box-shadow: 0 0 6px #4ade80; animation: pulse 1.5s infinite; }
   @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
 
   .loading { color: #64748b; padding: 2rem 0; }
+  .alert { background: #3b1a1a; border: 1px solid #7f1d1d; padding: 0.75rem 1rem; border-radius: 6px; margin-bottom: 1rem; font-size: 0.875rem; }
 
-  .alert {
-    background: #3b1a1a; border: 1px solid #7f1d1d;
-    padding: 0.75rem 1rem; border-radius: 6px; margin-bottom: 1rem; font-size: 0.875rem;
-  }
+  .header { display: flex; justify-content: space-between; align-items: flex-start; gap: 1rem; margin-bottom: 1.25rem; flex-wrap: wrap; }
+  .title-row { display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; margin-bottom: 0.375rem; }
+  h1 { font-size: 1.25rem; font-weight: 700; }
 
-  /* header */
-  .header {
-    display: flex; justify-content: space-between; align-items: flex-start;
-    gap: 1rem; margin-bottom: 1.25rem; flex-wrap: wrap;
+  .hbadge {
+    font-size: 0.65rem; font-weight: 700; padding: 0.15rem 0.45rem;
+    border-radius: 3px; text-transform: uppercase; letter-spacing: 0.05em; white-space: nowrap;
   }
-  h1 { font-size: 1.25rem; font-weight: 700; margin-bottom: 0.375rem; }
+  .hbadge.deferred { background: #1a2a3a; color: #7dd3fc; }
+  .hbadge.partial  { background: #2a1f3a; color: #c084fc; }
+  .hbadge.concat   { background: #1a2f3a; color: #67e8f9; }
 
   .id-chip {
     display: inline-flex; align-items: center; gap: 0.5rem;
@@ -343,22 +375,17 @@
 
   .header-right { display: flex; align-items: center; gap: 0.75rem; flex-wrap: wrap; }
   .actions { display: flex; gap: 0.5rem; }
-  .btn {
-    padding: 0.375rem 0.875rem; border-radius: 6px; border: none;
-    cursor: pointer; font-size: 0.875rem; font-weight: 500;
-  }
-  .btn.primary { background: #1d4ed8; color: #fff; }
-  .btn.primary:hover { background: #2563eb; }
-  .btn.danger  { background: #991b1b; color: #fff; }
-  .btn.danger:hover  { background: #b91c1c; }
-  .btn.delete  { background: #2d3148; color: #f87171; border: 1px solid #7f1d1d; }
-  .btn.delete:hover  { background: #3a1a1a; }
+  .btn { padding: 0.375rem 0.875rem; border-radius: 6px; border: 1px solid transparent; cursor: pointer; font-size: 0.875rem; font-weight: 500; text-decoration: none; display: inline-block; }
+  .btn.primary  { background: #1d4ed8; color: #fff; }
+  .btn.primary:hover  { background: #2563eb; }
+  .btn.danger   { background: #991b1b; color: #fff; }
+  .btn.danger:hover   { background: #b91c1c; }
+  .btn.delete   { background: #2d3148; color: #f87171; border-color: #7f1d1d; }
+  .btn.delete:hover   { background: #3a1a1a; }
+  .btn.download { background: #1a2f1a; color: #4ade80; border-color: #166534; }
+  .btn.download:hover { background: #14532d; }
 
-  /* progress (active uploads) */
-  .prog-section {
-    background: #1e2130; border: 1px solid #2d3148; border-radius: 8px;
-    padding: 1rem; margin-bottom: 1.25rem;
-  }
+  .prog-section { background: #1e2130; border: 1px solid #2d3148; border-radius: 8px; padding: 1rem; margin-bottom: 1.25rem; }
   .prog-header { display: flex; justify-content: space-between; margin-bottom: 0.5rem; font-size: 0.875rem; color: #94a3b8; }
   .prog-header .pct { font-weight: 700; color: #e2e8f0; }
   .prog-track { height: 10px; background: #2d3148; border-radius: 5px; overflow: hidden; }
@@ -366,65 +393,47 @@
   .prog-fill.animated { background: linear-gradient(90deg, #3b82f6, #60a5fa, #3b82f6); background-size: 200%; animation: shimmer 1.5s infinite linear; }
   @keyframes shimmer { from { background-position: 100% } to { background-position: -100% } }
 
-  /* info grid */
-  .grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
-    gap: 1rem; margin-bottom: 1.5rem;
-  }
-  .card {
-    background: #1e2130; border: 1px solid #2d3148; border-radius: 8px; padding: 1rem;
-  }
-  .card-title {
-    font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.07em;
-    color: #64748b; margin-bottom: 0.75rem; font-weight: 600;
-  }
-  .stat-row {
-    display: flex; justify-content: space-between; align-items: baseline;
-    gap: 0.5rem; margin-bottom: 0.4rem; font-size: 0.8rem;
-  }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 1rem; margin-bottom: 1.5rem; }
+  .card { background: #1e2130; border: 1px solid #2d3148; border-radius: 8px; padding: 1rem; }
+  .card-title { font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.07em; color: #64748b; margin-bottom: 0.75rem; font-weight: 600; }
+  .stat-row { display: flex; justify-content: space-between; align-items: baseline; gap: 0.5rem; margin-bottom: 0.4rem; font-size: 0.8rem; }
   .stat-row span:first-child { color: #64748b; flex-shrink: 0; }
   .stat-row strong { font-weight: 500; text-align: right; word-break: break-all; }
   .path { font-family: monospace; font-size: 0.72rem; color: #94a3b8; }
   .prog-mini { height: 4px; background: #2d3148; border-radius: 2px; overflow: hidden; margin-top: 0.5rem; }
 
-  /* event log */
+  .concat-label { font-size: 0.7rem; color: #64748b; margin: 0.5rem 0 0.25rem; text-transform: uppercase; letter-spacing: 0.04em; }
+  .concat-list { list-style: none; display: flex; flex-direction: column; gap: 0.2rem; }
+  .concat-list li { font-size: 0.75rem; font-family: monospace; }
+  .concat-list a { color: #60a5fa; }
+  .concat-list a:hover { text-decoration: underline; }
+
   .events { margin-top: 0.5rem; }
   .events-header { display: flex; align-items: center; gap: 0.75rem; margin-bottom: 0.75rem; }
   h2 { font-size: 0.9rem; font-weight: 600; display: flex; align-items: center; gap: 0.4rem; }
-  .count {
-    background: #2d3148; color: #94a3b8; font-size: 0.7rem;
-    padding: 0.1rem 0.45rem; border-radius: 999px;
-  }
+  .count { background: #2d3148; color: #94a3b8; font-size: 0.7rem; padding: 0.1rem 0.45rem; border-radius: 999px; }
   .live-badge { font-size: 0.7rem; color: #4ade80; }
-  .dim { color: #64748b; font-size: 0.875rem; }
+  .dim { color: #64748b; }
+  .small { font-size: 0.8rem; }
 
   ul { list-style: none; display: flex; flex-direction: column; gap: 2px; }
-  li {
-    display: flex; align-items: baseline; gap: 0.625rem;
-    padding: 0.4rem 0.625rem; border-radius: 4px; font-size: 0.8rem;
-    background: #161824;
-  }
+  li { display: flex; align-items: baseline; gap: 0.625rem; padding: 0.4rem 0.625rem; border-radius: 4px; font-size: 0.8rem; background: #161824; }
   li:nth-child(even) { background: #1a1f30; }
-
   .ev-dot { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; margin-top: 1px; }
   .ev-type { font-weight: 600; flex-shrink: 0; }
   .ev-count { font-size: 0.7rem; color: #64748b; background: #2d3148; padding: 0 0.3rem; border-radius: 3px; }
   .ev-msg { color: #94a3b8; flex: 1; font-family: monospace; font-size: 0.75rem; }
   .ev-time { color: #475569; font-size: 0.72rem; flex-shrink: 0; margin-left: auto; font-family: monospace; }
 
-  /* badges */
-  .badge {
-    display: inline-block; padding: 0.2rem 0.55rem; border-radius: 4px;
-    font-size: 0.72rem; font-weight: 600; white-space: nowrap;
-  }
-  .badge.created          { background: #1e2a3a; color: #93c5fd; }
-  .badge.uploading        { background: #1e3a5f; color: #60a5fa; }
-  .badge.completed        { background: #1a3a2a; color: #86efac; }
-  .badge.processing       { background: #3a2e1a; color: #fcd34d; }
-  .badge.finalized        { background: #1a2f1a; color: #4ade80; }
+  .badge { display: inline-block; padding: 0.2rem 0.55rem; border-radius: 4px; font-size: 0.72rem; font-weight: 600; white-space: nowrap; }
+  .badge.created              { background: #1e2a3a; color: #93c5fd; }
+  .badge.uploading            { background: #1e3a5f; color: #60a5fa; }
+  .badge.completed            { background: #1a3a2a; color: #86efac; }
+  .badge.processing           { background: #3a2e1a; color: #fcd34d; }
+  .badge.finalized            { background: #1a2f1a; color: #4ade80; }
   .badge.failedupload,
   .badge.failedprocessing,
-  .badge.failedfinalization { background: #3a1a1a; color: #f87171; }
-  .badge.abandoned        { background: #1e2130; color: #475569; }
+  .badge.failedfinalization   { background: #3a1a1a; color: #f87171; }
+  .badge.abandoned            { background: #1e2130; color: #475569; }
+  .badge.consumedbyconcat     { background: #1f1a2e; color: #a78bfa; }
 </style>

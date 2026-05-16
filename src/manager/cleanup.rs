@@ -26,4 +26,42 @@ async fn run_once(state: AppState) {
         }
         Err(e) => error!("cleanup scan failed: {e}"),
     }
+
+    let retention_days = state.config.webhook_delivery_retention_days;
+    match state.webhook_repo.prune_old_deliveries(retention_days).await {
+        Ok(0) => {}
+        Ok(n) => info!(count = n, "pruned old webhook deliveries"),
+        Err(e) => error!("webhook delivery pruning failed: {e}"),
+    }
+
+    match sqlx::query(
+        "DELETE FROM sessions WHERE datetime(expires_at) <= datetime('now')",
+    )
+    .execute(&state.db_pool)
+    .await
+    {
+        Ok(r) if r.rows_affected() > 0 => {
+            info!(count = r.rows_affected(), "pruned expired sessions")
+        }
+        Ok(_) => {}
+        Err(e) => error!("session pruning failed: {e}"),
+    }
+
+    let audit_retention = state.config.audit_log_retention_days;
+    if audit_retention > 0 {
+        let threshold = format!("-{audit_retention} days");
+        match sqlx::query(
+            "DELETE FROM audit_log WHERE datetime(created_at) < datetime('now', ?)",
+        )
+        .bind(&threshold)
+        .execute(&state.db_pool)
+        .await
+        {
+            Ok(r) if r.rows_affected() > 0 => {
+                info!(count = r.rows_affected(), "pruned old audit log entries")
+            }
+            Ok(_) => {}
+            Err(e) => error!("audit log pruning failed: {e}"),
+        }
+    }
 }

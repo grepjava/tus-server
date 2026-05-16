@@ -1,0 +1,83 @@
+services:
+  tus:
+    build: .
+    ports:
+      - "${BIND_PORT:-3000}:3000"
+    volumes:
+      - tus-data:/data
+      - tus-uploads:/uploads
+      # ClamAV signature database — shared with the freshclam-update sidecar.
+      # Only used when PROCESSORS includes "av".
+      - clamav-data:/var/lib/clamav
+    environment:
+      DATABASE_URL: /data/tus.db
+      STORAGE_DIR: /uploads
+      BASE_URL: ${BASE_URL:-http://localhost:3000}
+      BIND_ADDR: 0.0.0.0:3000
+      RUST_LOG: ${RUST_LOG:-info}
+      GRAFANA_URL: ${GRAFANA_URL:-http://localhost:3001}
+      # Uncomment to enable processors. Example: PROCESSORS=av,mime_filter
+      # PROCESSORS: av
+    restart: unless-stopped
+    depends_on:
+      - prometheus
+
+  # Keeps ClamAV signatures up to date once per day.
+  # Only consumes resources when running; exits immediately after each update.
+  # Remove this service if you are not using PROCESSORS=av.
+  freshclam-update:
+    image: debian:bookworm-slim
+    volumes:
+      - clamav-data:/var/lib/clamav
+    entrypoint: >
+      sh -c "
+        apt-get update -qq &&
+        apt-get install -y --no-install-recommends clamav ca-certificates -qq &&
+        rm -rf /var/lib/apt/lists/* &&
+        while true; do
+          echo '[freshclam] Updating ClamAV signatures…';
+          freshclam --quiet --no-warnings --datadir=/var/lib/clamav || true;
+          echo '[freshclam] Done. Sleeping 24h.';
+          sleep 86400;
+        done
+      "
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=30d
+      - --web.enable-lifecycle
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "${GRAFANA_PORT:-3001}:3000"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_AUTH_DISABLE_LOGIN_FORM: "false"
+      GF_SECURITY_ALLOW_EMBEDDING: "true"
+      GF_SERVER_ROOT_URL: ${GRAFANA_URL:-http://localhost:3001}
+      GF_USERS_DEFAULT_THEME: dark
+    restart: unless-stopped
+    depends_on:
+      - prometheus
+
+volumes:
+  tus-data:
+  tus-uploads:
+  clamav-data:
+  prometheus-data:
+  grafana-data:

@@ -1,30 +1,36 @@
 #!/usr/bin/env bash
+# Stop all Tuskar services.
+#   ./stop.sh           — stop containers, keep volumes (data preserved)
+#   ./stop.sh --clean   — stop containers and remove all volumes (full reset)
 set -euo pipefail
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PID_FILE="$DIR/.server.pid"
+cd "$DIR"
 
-if [[ ! -f "$PID_FILE" ]]; then
-  echo "No PID file found — server may not be running."
-  exit 0
+YELLOW='\033[1;33m'; BOLD='\033[1m'; RESET='\033[0m'
+
+if docker compose version >/dev/null 2>&1; then
+  COMPOSE="docker compose"
+elif command -v docker-compose >/dev/null 2>&1; then
+  COMPOSE="docker-compose"
+else
+  echo "Docker Compose not found." >&2; exit 1
 fi
 
-PID=$(cat "$PID_FILE")
+CLEAN=false
+for arg in "$@"; do
+  [[ "$arg" == "--clean" ]] && CLEAN=true
+done
 
-if kill -0 "$PID" 2>/dev/null; then
-  kill "$PID"
-  # Wait up to 5s for graceful shutdown
-  for i in $(seq 1 10); do
-    kill -0 "$PID" 2>/dev/null || break
-    sleep 0.5
-  done
-  if kill -0 "$PID" 2>/dev/null; then
-    echo "Process did not exit — sending SIGKILL."
-    kill -9 "$PID"
-  fi
-  rm -f "$PID_FILE"
-  echo "TUS server stopped (PID $PID)."
+if [[ "$CLEAN" == true ]]; then
+  echo -e "${YELLOW}--clean: all volumes (uploads, database, Prometheus data, Grafana data) will be deleted.${RESET}"
+  read -r -p "  Are you sure? [y/N] " confirm
+  [[ "$confirm" =~ ^[Yy]$ ]] || { echo "Aborted."; exit 0; }
+  echo "Stopping Tuskar and removing volumes…"
+  $COMPOSE down --volumes
+  echo "All data removed."
 else
-  echo "Process $PID not running — cleaning up stale PID file."
-  rm -f "$PID_FILE"
+  echo "Stopping Tuskar…"
+  $COMPOSE down
+  echo -e "Stopped. Data is preserved. Run ${BOLD}./start.sh${RESET} to restart."
 fi

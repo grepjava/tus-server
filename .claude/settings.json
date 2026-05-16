@@ -1,0 +1,50 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo test *)",
+      "WebSearch",
+      "WebFetch(domain:pub.dev)",
+      "WebFetch(domain:github.com)",
+      "Bash(chmod +x /home/grepjava/code/tus/build.sh)",
+      "Bash(identify /home/grepjava/code/tus/logo/tuskar.png)",
+      "Bash(python3 -c ' *)",
+      "Bash(chmod +x /home/grepjava/code/tus/setup.sh /home/grepjava/code/tus/start.sh /home/grepjava/code/tus/stop.sh)",
+      "Bash(bash -n /home/grepjava/code/tus/setup.sh)",
+      "Bash(bash -n /home/grepjava/code/tus/start.sh)",
+      "Bash(bash -n /home/grepjava/code/tus/stop.sh)",
+      "Bash(chmod +x /home/grepjava/code/tus/docker-entrypoint.sh)",
+      "Bash(bash -n /home/grepjava/code/tus/docker-entrypoint.sh)",
+      "Bash(sqlite3 /home/grepjava/code/tus/tus.db \"SELECT name FROM sqlite_master WHERE type='table';\")",
+      "Bash(cargo run *)",
+      "Bash(sqlite3 /home/grepjava/code/tus/tus.db \".tables\")",
+      "Bash(sqlite3 /home/grepjava/code/tus/tus.db \"SELECT id, username, role, substr\\(password_hash,1,20\\) as hash_prefix FROM users;\")",
+      "Bash(curl -s -X POST http://localhost:3000/api/auth/login -H 'Content-Type: application/json' -d '{\"username\":\"admin\",\"password\":\"admin123\"}')",
+      "Bash(curl -si http://localhost:3000/api/auth/me)",
+      "Bash(pkill -f tus-server)",
+      "Bash(./target/debug/tus-server)",
+      "Bash(curl -si -X POST http://localhost:3000/api/auth/login -H 'Content-Type: application/json' -d '{\"username\":\"admin\",\"password\":\"admin123\"}')",
+      "Bash(fuser 3000/tcp)",
+      "Bash(RUST_LOG=info ./target/debug/tus-server > /tmp/tus.log 2>&1 & *)",
+      "Bash(fuser -k 3000/tcp)",
+      "Bash(# find the process holding port 3000 *)",
+      "Read(//proc/**)",
+      "Bash(docker cp *)",
+      "Bash(grep -a \"admin\\\\|password_hash\\\\|\\\\$2b\\\\$\" /tmp/tus_live.db)",
+      "Bash(grep -E \"admin|\\\\\\\\\\\\$2\")",
+      "Bash(python3 -c \"from PIL import Image; img=Image.open\\('/home/grepjava/code/tus/logo/tuskar.png'\\); print\\(img.size\\)\")",
+      "Bash(cargo add *)",
+      "Bash(echo \"exit: $?\")",
+      "Bash(npx tsc *)",
+      "Bash(identify /home/grepjava/code/tus/dashboard-ui/static/tuskar.png)",
+      "Bash(python3 -c \"from PIL import Image; print\\('pillow ok'\\)\")",
+      "Bash(pip3 install *)",
+      "Bash(python3 -c \"from PIL import Image; print\\('ok'\\)\")",
+      "Bash(python3 -)",
+      "Bash(curl -si http://localhost:3000/api/health)",
+      "Bash(curl -si http://localhost:3000/)"
+    ],
+    "additionalDirectories": [
+      "/tmp"
+    ]
+  }
+}

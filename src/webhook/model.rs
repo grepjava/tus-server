@@ -13,6 +13,7 @@ pub struct WebhookConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NewWebhookConfig {
     pub name: String,
     pub url: String,
@@ -21,6 +22,7 @@ pub struct NewWebhookConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UpdateWebhookConfig {
     pub name: String,
     pub url: String,

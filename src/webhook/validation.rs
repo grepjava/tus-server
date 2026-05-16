@@ -1,6 +1,44 @@
-use std::net::IpAddr;
+use std::{net::IpAddr, sync::Arc};
+
+use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 
 use crate::tus::TusError;
+
+/// Custom DNS resolver that blocks private/link-local IPs at connection time,
+/// preventing DNS rebinding attacks where a hostname passes validation with a
+/// public IP then flips to an internal address before delivery.
+pub struct SsrfSafeResolver;
+
+impl Resolve for SsrfSafeResolver {
+    fn resolve(&self, name: Name) -> Resolving {
+        let host = name.as_str().to_string();
+        Box::pin(async move {
+            type BoxErr = Box<dyn std::error::Error + Send + Sync>;
+
+            let addrs = match tokio::net::lookup_host(format!("{host}:0")).await {
+                Ok(iter) => iter.filter(|a| !is_blocked_ip(a.ip())).collect::<Vec<_>>(),
+                Err(e) => return Err(Box::new(e) as BoxErr),
+            };
+
+            if addrs.is_empty() {
+                return Err(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "webhook target resolves only to blocked addresses (SSRF protection)",
+                )) as BoxErr);
+            }
+
+            Ok(Box::new(addrs.into_iter()) as Addrs)
+        })
+    }
+}
+
+pub fn ssrf_safe_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .dns_resolver(Arc::new(SsrfSafeResolver))
+        .build()
+        .expect("failed to build SSRF-safe HTTP client")
+}
 
 pub async fn validate_webhook_url(url: &str) -> Result<(), TusError> {
     let parsed = reqwest::Url::parse(url)

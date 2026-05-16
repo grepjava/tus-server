@@ -4,15 +4,15 @@
   import { api } from '$lib/api';
 
   const ALL_EVENTS = [
-    { value: 'created',            label: 'Upload created' },
-    { value: 'chunk_received',     label: 'Chunk received' },
-    { value: 'completed',          label: 'Upload completed' },
-    { value: 'processing_started', label: 'Processing started' },
-    { value: 'finalized',          label: 'Finalized' },
-    { value: 'processing_failed',  label: 'Processing failed' },
-    { value: 'abandoned',          label: 'Abandoned' },
-    { value: 'deleted',            label: 'Deleted' },
-    { value: 'retry_queued',       label: 'Retry queued' },
+    { value: 'created',            label: 'Upload created',       desc: 'A new upload slot was created; no bytes have arrived yet' },
+    { value: 'chunk_received',     label: 'Chunk received',       desc: 'Fires on every PATCH — high volume, use only for real-time progress' },
+    { value: 'completed',          label: 'Upload completed',     desc: 'All bytes received; processors (AV scan, etc.) may still be running' },
+    { value: 'processing_started', label: 'Processing started',   desc: 'A processor (AV scan / MIME filter) has begun on the file' },
+    { value: 'finalized',          label: 'Finalized',            desc: '✓ Recommended — all processors passed; file is safe and ready to use', recommended: true },
+    { value: 'processing_failed',  label: 'Processing failed',    desc: 'A processor rejected or errored — file may be quarantined' },
+    { value: 'abandoned',          label: 'Abandoned',            desc: 'Upload expired or was manually marked as abandoned' },
+    { value: 'deleted',            label: 'Deleted',              desc: 'Upload and its stored file were permanently removed' },
+    { value: 'retry_queued',       label: 'Retry queued',         desc: 'Processing was manually re-queued via the dashboard' },
   ];
 
   let webhooks       = $state<WebhookConfig[]>([]);
@@ -52,7 +52,7 @@
 
   function openEdit(wh: WebhookConfig) {
     editing = wh;
-    formName = wh.name; formUrl = wh.url; formSecret = wh.secret ?? '';
+    formName = wh.name; formUrl = wh.url; formSecret = '';
     formEvents = new Set(wh.events); formEnabled = wh.enabled; formError = '';
     showForm = true;
     selectedId = null;
@@ -110,7 +110,7 @@
 
   async function toggle(wh: WebhookConfig) {
     const updated = await api.updateWebhook(wh.id, {
-      name: wh.name, url: wh.url, secret: wh.secret,
+      name: wh.name, url: wh.url, secret: null,
       events: wh.events, enabled: !wh.enabled,
     });
     webhooks = webhooks.map(w => w.id === updated.id ? updated : w);
@@ -196,7 +196,7 @@
 
           <label>
             URL
-            <input bind:value={formUrl} placeholder="https://example.com/hooks/tus" type="url" />
+            <input bind:value={formUrl} placeholder="https://example.com/hooks/tus" autocomplete="off" />
           </label>
 
           <label>
@@ -208,9 +208,12 @@
             <legend>Trigger on events</legend>
             <div class="events-grid">
               {#each ALL_EVENTS as ev}
-                <label class="check-label">
+                <label class="check-label" class:recommended={ev.recommended}>
                   <input type="checkbox" checked={formEvents.has(ev.value)} onchange={() => toggleEvent(ev.value)} />
-                  {ev.label}
+                  <div class="ev-text">
+                    <span class="ev-label">{ev.label}</span>
+                    <span class="ev-desc">{ev.desc}</span>
+                  </div>
                 </label>
               {/each}
             </div>
@@ -388,18 +391,29 @@
   legend { font-size: 0.8rem; color: #94a3b8; padding: 0 0.25rem; }
 
   .events-grid {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 0.5rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
     margin-top: 0.5rem;
   }
 
   .check-label {
-    display: flex; align-items: center; gap: 0.5rem;
+    display: flex; align-items: flex-start; gap: 0.6rem;
     font-size: 0.825rem; color: #cbd5e1; cursor: pointer;
     flex-direction: row;
+    padding: 0.45rem 0.5rem;
+    border-radius: 6px;
+    border: 1px solid transparent;
+    transition: background 0.1s;
   }
-  .check-label input[type="checkbox"] { width: 14px; height: 14px; accent-color: #60a5fa; }
+  .check-label:hover { background: #252840; }
+  .check-label.recommended { border-color: #1d4ed840; background: #1d4ed810; }
+  .check-label.recommended:hover { background: #1d4ed825; }
+  .check-label input[type="checkbox"] { width: 14px; height: 14px; accent-color: #60a5fa; margin-top: 2px; flex-shrink: 0; }
+
+  .ev-text { display: flex; flex-direction: column; gap: 0.15rem; }
+  .ev-label { font-size: 0.825rem; color: #cbd5e1; font-weight: 500; }
+  .ev-desc  { font-size: 0.75rem; color: #64748b; line-height: 1.4; }
 
   .toggle-row { flex-direction: row; color: #cbd5e1; }
 

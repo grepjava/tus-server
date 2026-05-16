@@ -4,12 +4,18 @@ use futures::StreamExt;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use tokio::sync::{broadcast, Semaphore};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
-use crate::tus::{UploadEvent, UploadService};
+use crate::{
+    config::Config,
+    metrics::{AppMetrics, DeliveryLabels},
+    tus::{UploadEvent, UploadService},
+};
 use super::{
     model::{NewWebhookDelivery, WebhookConfig},
     repository::WebhookRepository,
+    validation::ssrf_safe_client,
 };
 
 const MAX_RESPONSE_BODY: usize = 4096;
@@ -21,6 +27,8 @@ pub struct WebhookDispatcher {
     storage_dir: PathBuf,
     semaphore: Arc<Semaphore>,
     client: reqwest::Client,
+    config: Arc<Config>,
+    metrics: Arc<AppMetrics>,
 }
 
 impl WebhookDispatcher {
@@ -28,17 +36,17 @@ impl WebhookDispatcher {
         repo: Arc<dyn WebhookRepository>,
         upload_service: Arc<UploadService>,
         storage_dir: PathBuf,
+        config: Arc<Config>,
+        metrics: Arc<AppMetrics>,
     ) -> Self {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(10))
-            .build()
-            .expect("failed to build HTTP client");
         Self {
             repo,
             upload_service,
             storage_dir,
             semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_DISPATCHES)),
-            client,
+            client: ssrf_safe_client(),
+            config,
+            metrics,
         }
     }
 
@@ -55,14 +63,34 @@ impl WebhookDispatcher {
                         d.dispatch(event).await;
                     });
                 }
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    warn!(dropped = n, "webhook dispatcher lagged, scanning for missed deliveries");
+                    let d = Arc::clone(&self);
+                    tokio::spawn(async move {
+                        match d.repo.list_missed_events(15).await {
+                            Ok(events) if events.is_empty() => {}
+                            Ok(events) => {
+                                info!(count = events.len(), "re-dispatching missed webhook events");
+                                for event in events {
+                                    let d2 = Arc::clone(&d);
+                                    tokio::spawn(async move {
+                                        let _permit = d2.semaphore.acquire().await
+                                            .expect("semaphore closed unexpectedly");
+                                        d2.dispatch(event).await;
+                                    });
+                                }
+                            }
+                            Err(e) => error!(error = %e, "webhook lag recovery scan failed"),
+                        }
+                    });
+                }
                 Err(broadcast::error::RecvError::Closed) => break,
             }
         }
     }
 
     async fn dispatch(&self, event: UploadEvent) {
-        let hooks = match self.repo.list_for_event(&event.event_type).await {
+        let hooks = match self.repo.list_for_event(&event.event_type, event.context_id.as_deref()).await {
             Ok(h) => h,
             Err(e) => {
                 tracing::error!(
@@ -124,7 +152,9 @@ impl WebhookDispatcher {
         let mut last_body: Option<String> = None;
         let mut attempts = 0i64;
 
-        for attempt in 1u32..=3 {
+        let max_attempts = self.config.webhook_max_attempts;
+
+        for attempt in 1u32..=max_attempts {
             attempts = attempt as i64;
 
             let mut builder = self
@@ -175,10 +205,21 @@ impl WebhookDispatcher {
                 }
             }
 
-            if attempt < 3 {
-                tokio::time::sleep(Duration::from_secs(if attempt == 1 { 1 } else { 4 })).await;
+            if attempt < max_attempts {
+                let delay_idx = (attempt - 1) as usize;
+                let delay = self.config.webhook_retry_delays_secs
+                    .get(delay_idx)
+                    .copied()
+                    .unwrap_or_else(|| *self.config.webhook_retry_delays_secs.last().unwrap_or(&1));
+                tokio::time::sleep(Duration::from_secs(delay)).await;
             }
         }
+
+        let outcome = if last_error.is_none() { "success" } else { "failure" };
+        self.metrics
+            .webhook_deliveries_total
+            .get_or_create(&DeliveryLabels { outcome: outcome.to_string() })
+            .inc();
 
         if let Err(e) = self
             .repo
